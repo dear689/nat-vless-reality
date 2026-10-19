@@ -4,7 +4,7 @@ set -Eeuo pipefail
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
-DEFAULT_SNI="www.microsoft.com"
+DEFAULT_SNI="gateway.icloud.com"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2

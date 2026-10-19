@@ -4,7 +4,7 @@ set -eu
 XRAY_BIN=/usr/local/bin/xray
 XRAY_CONFIG=/usr/local/etc/xray/config.json
 XRAY_SERVICE=/etc/init.d/xray
-DEFAULT_SNI=www.microsoft.com
+DEFAULT_SNI=gateway.icloud.com
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
