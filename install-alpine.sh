@@ -65,8 +65,11 @@ case "$(uname -m)" in
   *) fail "Unsupported architecture: $(uname -m)." ;;
 esac
 
-apk add --no-cache ca-certificates curl openssl jq unzip
-tmp_dir=$(mktemp -d)
+apk add --no-cache ca-certificates
+apk add --no-cache --virtual .nat-vless-build-deps curl jq unzip
+# Keep the archive and extracted binary on disk, not in a possible /tmp tmpfs.
+install -d -m 755 /usr/local
+tmp_dir=$(mktemp -d /usr/local/.nat-vless-install.XXXXXX) || fail 'Not enough disk space for installation.'
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 release="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$machine.zip"
 curl -fsSL "$release" -o "$tmp_dir/xray.zip"
@@ -82,7 +85,8 @@ private_key=$(printf '%s\n' "$key_output" | sed -nE 's/^Private ?[Kk]ey:[[:space
 public_key=$(printf '%s\n' "$key_output" | sed -nE 's/^(Password( \(PublicKey\))?|Public ?[Kk]ey):[[:space:]]*//p' | head -n 1)
 [ -n "$private_key" ] && [ -n "$public_key" ] || fail 'Could not parse REALITY keypair.'
 uuid=$("$tmp_dir/xray" uuid)
-short_id=$(openssl rand -hex 8)
+short_id=$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d '[:space:]')
+[ "${#short_id}" -eq 16 ] || fail 'Could not generate a REALITY short ID.'
 
 jq -n \
   --arg address "$listen_address" --argjson port "$listen_port" \
@@ -117,6 +121,8 @@ cat > "$XRAY_SERVICE" <<OPENRC
 #!/sbin/openrc-run
 name="Xray"
 description="VLESS REALITY server"
+# Lower the Go heap target to trade some CPU for memory on tiny hosts.
+export GOGC=50
 supervisor=supervise-daemon
 command=/usr/local/bin/xray
 command_args="run -config /usr/local/etc/xray/config.json"
@@ -133,6 +139,10 @@ case "$public_host" in
   *:*) case "$public_host" in \[*\]) ;; *) public_host="[$public_host]" ;; esac ;;
 esac
 encoded_name=$(jq -nr --arg value "$node_name" '$value | @uri')
+# Clean both the release archive and temporary packages after successful start.
+rm -rf "$tmp_dir"
+trap - EXIT HUP INT TERM
+apk del .nat-vless-build-deps || printf 'Warning: installer-only packages could not be removed.\n' >&2
 printf '\nXray service is active. VLESS link (keep private):\n'
 printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
   "$uuid" "$public_host" "$public_port" "$server_name" "$public_key" "$short_id" "$encoded_name"
