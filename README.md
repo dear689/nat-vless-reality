@@ -3,7 +3,7 @@
 Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Choose one node type, start Xray, and receive a private `vless://` client import link:
 
 1. **Direct: VLESS + REALITY + TCP + Vision.** The default REALITY target is Apple's `gateway.icloud.com`.
-2. **External CDN origin: VLESS + WebSocket, without origin TLS.** No domain, certificate, reverse proxy, or CDN account is requested or configured by the script. A random WS path is generated and included in the link. You configure the CDN and edit the imported client yourself.
+2. **CDN-ready VLESS + WebSocket + client TLS.** The script asks for the CDN hostname and generates a directly importable link with that hostname as the address, SNI, and WebSocket Host. The CDN, DNS, proxy status, origin rule, and preferred edge IP remain external.
 
 Only one inbound is installed, not both. The Alpine variant targets **at least 128 MiB RAM / 1 GiB disk** and avoids Python, additional reverse proxies, panels, and Xray geodata. This is a minimum target, not a guarantee under every workload; 64 MiB is not supported as a deployment target.
 
@@ -32,21 +32,27 @@ sh install-alpine.sh
 
 Run the Alpine commands as root. The script requires **OpenRC to be booted**, not just installed, and exits before making changes otherwise. Some provider Podman images do not run OpenRC or do not persist container changes across rebuilds. Check with `test -e /run/openrc/softlevel && echo OpenRC-ready` before installing; if there is no output, this variant is not suitable for that image. A local TCP listen port below 1024 is not supported because the service runs as `nobody`.
 
-Choose **1** (default) or **2**, then enter the public IP/hostname, provider-mapped **public TCP port**, corresponding **local TCP listen port**, and node name. Only mode 1 asks for a REALITY SNI; mode 2 does not ask for a domain. The public and local ports may differ on a NAT VPS. The script then prints a `vless://` link for your client. Keep the link private: it contains credentials for the node.
+Choose **1** (default) or **2**, then enter the origin public IP/hostname, provider-mapped **public TCP port**, corresponding **local TCP listen port**, and node name. Mode 1 asks for a REALITY SNI. Mode 2 asks for the CDN hostname and uses client TLS port 443 by default. The public and local ports may differ on a NAT VPS. The script then prints a `vless://` link for your client. Keep the link private: it contains credentials for the node.
 
 The provider's external TCP port must map to the local listen port, and its firewall must allow that traffic. The script uses a direct outbound by default. For IPv6-only endpoints, enter the IPv6 address without square brackets; the generated link will add them.
 
-## External CDN mode
+## CDN mode
 
-Mode 2 serves **plain HTTP WebSocket** on the local listen port, with VLESS authentication and a random path. It has no Vision flow, REALITY keys, WS Host restriction, or certificate. The output link is an **origin template**, not a ready-to-use TLS/CDN node:
+Mode 2 serves **plain HTTP WebSocket** on the local listen port, with VLESS authentication and a random path. It has no Vision flow, REALITY keys, or origin certificate. The script asks for one CDN hostname and generates a client link like:
 
-- Import the link and keep the generated UUID and WS path unchanged.
-- In your client, change the server address to your CDN hostname or preferred CDN edge IP, select its public TLS port (for example, 443), enable TLS, and set SNI and WS Host to your own proxied hostname.
-- Configure your CDN externally to send HTTP WebSocket requests to the VPS public IP and provider-mapped **external** TCP port. Preserve the WS path and WebSocket upgrade. A CDN's supported client-facing ports are separate from the NAT origin port.
-- This origin cannot accept HTTPS. For Cloudflare, a Full/Full (strict) connection directly to this origin will fail; configure HTTP to this hostname's origin externally. The installer does not change any zone-wide or hostname-specific SSL settings.
-- TLS on the client-to-CDN leg does **not** encrypt the CDN-to-origin leg in this mode. The random path is not encryption or a firewall. Use a separately configured TLS reverse proxy if encrypted origin traffic is required; that is outside this lightweight installer.
+```text
+vless://UUID@cdn.example.com:443?encryption=none&security=tls&sni=cdn.example.com&fp=chrome&type=ws&host=cdn.example.com&path=%2Fws-random#NAT-VLESS-WS
+```
 
-No DNS records, CDN rules, certificates, or client settings are changed automatically. Do not import this template unchanged and expect CDN TLS to work.
+Before importing it, configure the CDN hostname externally:
+
+- Create the DNS record and enable proxying/CDN service for the hostname.
+- Enable WebSocket support and forward requests to the NAT VPS origin public address and provider-mapped **external** TCP port. The provider must map that port to the local listen port shown by the installer.
+- The client-facing CDN port (`443` in the generated link) and the NAT origin port are separate. If the provider port is non-standard, configure an explicit CDN origin-port rule, tunnel, or equivalent upstream mapping; the installer does not create that rule.
+- Keep the generated UUID and WS path unchanged. If you later select a preferred CDN edge IP, replace only the link address in the client; keep the CDN hostname as SNI and WebSocket Host.
+- The client-to-CDN leg uses TLS on port 443. The CDN-to-origin leg is still plaintext HTTP WebSocket. This script does not install an origin certificate or configure Cloudflare Full/Full (strict).
+
+No DNS records, CDN rules, certificates, proxy status, or preferred edge IPs are changed automatically.
 
 ## Scope and testing
 

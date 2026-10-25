@@ -11,6 +11,43 @@ fail() {
   exit 1
 }
 
+validate_hostname() {
+  local value="$1"
+  local label="$2"
+  local part
+  [[ "${#value}" -le 253 && "$value" != .* && "$value" != *. && "$value" != *..* ]] \
+    || fail "$label must be a DNS hostname without a scheme, port, or path."
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ || "$value" =~ ^[A-Za-z0-9]$ ]] \
+    || fail "$label must be a DNS hostname without a scheme, port, or path."
+  IFS=. read -r -a parts <<< "$value"
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
+      || fail "$label contains an invalid DNS label."
+  done
+}
+
+validate_host() {
+  local value="$1"
+  local label="$2"
+  local unbracketed="$value"
+  if [[ "$unbracketed" == \[*\] ]]; then
+    unbracketed="${unbracketed:1:${#unbracketed}-2}"
+  fi
+  if [[ "$unbracketed" == *:* ]]; then
+    [[ "$unbracketed" == *:*:* && "$unbracketed" =~ ^[A-Fa-f0-9:.]+$ ]] \
+      || fail "$label must be a plain IPv6 address without a port."
+  else
+    validate_hostname "$unbracketed" "$label"
+  fi
+}
+
+validate_port() {
+  local value="$1"
+  local label="$2"
+  [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$value <= 65535 )) \
+    || fail "$label must be between 1 and 65535."
+}
+
 [[ "${EUID}" -eq 0 ]] || fail "Run this script as root."
 [[ -f /etc/os-release ]] || fail "Cannot identify the operating system."
 [[ -d /run/systemd/system ]] || fail "This script requires systemd."
@@ -33,27 +70,28 @@ read -r -u 3 -p "Local listen port [${public_port}]: " listen_port
 listen_port="${listen_port:-$public_port}"
 server_name=""
 ws_path=""
+cdn_domain=""
+cdn_port="443"
 default_name="NAT-VLESS"
 if [[ "$node_type" == 1 ]]; then
   read -r -u 3 -p "REALITY SNI [${DEFAULT_SNI}]: " server_name
   server_name="${server_name:-$DEFAULT_SNI}"
 else
   default_name="NAT-VLESS-WS"
-  printf 'CDN mode: no domain/certificate setup; an HTTP WebSocket path will be generated.\n'
+  read -r -u 3 -p "CDN domain (SNI and WebSocket Host): " cdn_domain
 fi
 read -r -u 3 -p "Node name [${default_name}]: " node_name
 node_name="${node_name:-$default_name}"
 exec 3<&-
 
 [[ -n "$public_host" ]] || fail "Public host is required."
-[[ "$public_host" =~ ^[A-Za-z0-9.:-]+$ || "$public_host" =~ ^\[[A-Fa-f0-9:]+\]$ ]] \
-  || fail "Public host must be an IP address or DNS hostname (without a scheme or port)."
-[[ "$public_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$public_port <= 65535 )) \
-  || fail "Public TCP port must be between 1 and 65535."
-[[ "$listen_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$listen_port <= 65535 )) \
-  || fail "Local listen port must be between 1 and 65535."
+validate_host "$public_host" "Origin public host"
+validate_port "$public_port" "Provider-mapped public TCP port"
+validate_port "$listen_port" "Local listen port"
 if [[ "$node_type" == 1 ]]; then
-  [[ "$server_name" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid SNI hostname."
+  validate_hostname "$server_name" "REALITY SNI"
+else
+  validate_hostname "$cdn_domain" "CDN domain"
 fi
 listen_address="0.0.0.0"
 if [[ "$public_host" == *:* ]]; then
@@ -98,6 +136,8 @@ export XRAY_SHORT_ID="$short_id"
 export XRAY_LISTEN_PORT="$listen_port"
 export XRAY_LISTEN_ADDRESS="$listen_address"
 export XRAY_SERVER_NAME="$server_name"
+export XRAY_CDN_DOMAIN="$cdn_domain"
+export XRAY_CDN_PORT="$cdn_port"
 python3 - "$tmp_dir/config.json" <<'PY'
 import json
 import os
@@ -165,9 +205,13 @@ python3 <<'PY'
 import os
 from urllib.parse import quote, urlencode
 
-host = os.environ["XRAY_PUBLIC_HOST"]
-if ":" in host and not (host.startswith("[") and host.endswith("]")):
-    host = f"[{host}]"
+def format_host(value):
+    if ":" in value and not (value.startswith("[") and value.endswith("]")):
+        return f"[{value}]"
+    return value
+
+origin_host = format_host(os.environ["XRAY_PUBLIC_HOST"])
+host = origin_host
 name = quote(os.environ["XRAY_NODE_NAME"], safe="-._~")
 if os.environ["XRAY_NODE_TYPE"] == "1":
     params = urlencode({
@@ -181,8 +225,12 @@ if os.environ["XRAY_NODE_TYPE"] == "1":
         "type": "tcp",
     })
 else:
+    host = os.environ["XRAY_CDN_DOMAIN"]
     params = urlencode({
-        "encryption": "none", "security": "none", "type": "ws",
+        "encryption": "none", "security": "tls",
+        "sni": os.environ["XRAY_CDN_DOMAIN"],
+        "fp": "chrome", "type": "ws",
+        "host": os.environ["XRAY_CDN_DOMAIN"],
         "path": os.environ["XRAY_WS_PATH"],
     })
 print("\nXray service is active.")
@@ -193,7 +241,11 @@ print(
     + "@"
     + host
     + ":"
-    + os.environ["XRAY_PUBLIC_PORT"]
+    + (
+        os.environ["XRAY_PUBLIC_PORT"]
+        if os.environ["XRAY_NODE_TYPE"] == "1"
+        else os.environ["XRAY_CDN_PORT"]
+    )
     + "?"
     + params
     + "#"
@@ -201,9 +253,15 @@ print(
 )
 if os.environ["XRAY_NODE_TYPE"] == "2":
     print("\nWebSocket origin path: " + os.environ["XRAY_WS_PATH"])
-    print("CDN setup is external. This link is an origin template, NOT a TLS/CDN-ready node.")
-    print("Client: set CDN address/edge port, enable TLS, set your domain as SNI and WS Host; keep UUID and path.")
-    print("Origin: forward HTTP WebSocket traffic to the mapped public TCP port; no TLS certificate is installed.")
+    print("CDN-ready client endpoint: " + host + ":" + os.environ["XRAY_CDN_PORT"])
+    print("CDN domain (SNI and WebSocket Host): " + os.environ["XRAY_CDN_DOMAIN"])
+    print("Origin: forward HTTP WebSocket traffic to "
+          + origin_host + ":" + os.environ["XRAY_PUBLIC_PORT"]
+          + " -> local TCP " + os.environ["XRAY_LISTEN_PORT"] + ".")
+    print("Enable CDN proxying and WebSocket support for this hostname externally.")
+    print("No DNS, proxy status, origin rule, or preferred edge IP is changed by this script.")
+    print("If you select a preferred CDN IP later, replace only the link address; keep SNI and WebSocket Host.")
+    print("The CDN-to-origin leg remains plaintext HTTP WebSocket; Full (strict) origin TLS is not configured.")
     print("WARNING: CDN-to-origin traffic is plaintext; a random path is not encryption or a firewall.")
 print("\nEnsure the provider maps the public TCP port to local TCP port "
       + os.environ["XRAY_LISTEN_PORT"]

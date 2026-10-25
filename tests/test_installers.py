@@ -45,6 +45,8 @@ def variables(mode, host="198.51.100.20"):
         "short_id": SID if mode == "1" else "",
         "server_name": "gateway.icloud.com" if mode == "1" else "",
         "ws_path": WS_PATH if mode == "2" else "",
+        "cdn_domain": "cdn.example.com" if mode == "2" else "",
+        "cdn_port": "443" if mode == "2" else "",
         "node_name": NAME,
     }
 
@@ -72,7 +74,8 @@ def python_env(values):
         "uuid": "UUID", "private_key": "PRIVATE_KEY", "public_key": "PUBLIC_KEY",
         "short_id": "SHORT_ID", "server_name": "SERVER_NAME",
         "public_host": "PUBLIC_HOST", "public_port": "PUBLIC_PORT",
-        "node_name": "NODE_NAME",
+        "node_name": "NODE_NAME", "cdn_domain": "CDN_DOMAIN",
+        "cdn_port": "CDN_PORT",
     }
     env.update({"XRAY_" + target: values[source] for source, target in mapping.items()})
     return env
@@ -150,8 +153,10 @@ class GeneratorTests(unittest.TestCase):
                     self.assertEqual(uri, link("alpine", mode, host))
                     parsed = urlsplit(uri)
                     self.assertEqual(parsed.username, UUID)
-                    self.assertEqual(parsed.hostname, host.strip("[]"))
-                    self.assertEqual(parsed.port, 30860)
+                    expected_host = host.strip("[]") if mode == "1" else "cdn.example.com"
+                    expected_port = 30860 if mode == "1" else 443
+                    self.assertEqual(parsed.hostname, expected_host)
+                    self.assertEqual(parsed.port, expected_port)
                     self.assertEqual(unquote(parsed.fragment), NAME)
                     query = parse_qs(parsed.query)
                     if mode == "1":
@@ -162,13 +167,21 @@ class GeneratorTests(unittest.TestCase):
                         })
                     else:
                         self.assertEqual(query, {
-                            "encryption": ["none"], "security": ["none"],
-                            "type": ["ws"], "path": [WS_PATH],
+                            "encryption": ["none"], "security": ["tls"],
+                            "sni": ["cdn.example.com"], "fp": ["chrome"],
+                            "type": ["ws"], "host": ["cdn.example.com"],
+                            "path": [WS_PATH],
                         })
 
     def test_apple_default_and_service_safety(self):
         self.assertIn("DEFAULT_SNI=gateway.icloud.com", ALPINE)
         self.assertIn('DEFAULT_SNI="gateway.icloud.com"', DEBIAN)
+        self.assertIn("CDN domain (SNI and WebSocket Host)", ALPINE)
+        self.assertIn("CDN domain (SNI and WebSocket Host)", DEBIAN)
+        self.assertNotIn("Preferred CDN edge", ALPINE)
+        self.assertNotIn("Preferred CDN edge", DEBIAN)
+        self.assertIn("validate_hostname", ALPINE)
+        self.assertIn("validate_hostname", DEBIAN)
         self.assertIn("rc-update add xray default", ALPINE)
         self.assertIn("systemctl enable xray.service", DEBIAN)
         self.assertIn("command_user=nobody:$service_group", ALPINE)

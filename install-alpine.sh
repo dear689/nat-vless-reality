@@ -11,6 +11,56 @@ fail() {
   exit 1
 }
 
+validate_hostname() {
+  value=$1
+  label=$2
+  case "$value" in
+    ''|.*|*.|*..*) fail "$label must be a DNS hostname without a scheme, port, or path." ;;
+  esac
+  [ "${#value}" -le 253 ] \
+    || fail "$label must be a DNS hostname without a scheme, port, or path."
+  printf '%s' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$|^[A-Za-z0-9]$' \
+    || fail "$label must be a DNS hostname without a scheme, port, or path."
+  old_ifs=$IFS
+  IFS=.
+  set -- $value
+  IFS=$old_ifs
+  for part do
+    printf '%s' "$part" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$' \
+      || fail "$label contains an invalid DNS label."
+  done
+}
+
+validate_host() {
+  value=$1
+  label=$2
+  unbracketed=$value
+  case "$unbracketed" in
+    \[*\])
+      unbracketed=${unbracketed#\[}
+      unbracketed=${unbracketed%\]}
+      ;;
+  esac
+  case "$unbracketed" in
+    *:*)
+      printf '%s' "$unbracketed" | grep -Eq '.*:.*:' \
+        && printf '%s' "$unbracketed" | grep -Eq '^[A-Fa-f0-9:.]+$' \
+        || fail "$label must be a plain IPv6 address without a port."
+      ;;
+    *)
+      validate_hostname "$unbracketed" "$label"
+      ;;
+  esac
+}
+
+validate_port() {
+  value=$1
+  label=$2
+  printf '%s' "$value" | grep -Eq '^[1-9][0-9]{0,4}$' \
+    || fail "$label must be between 1 and 65535."
+  [ "$value" -le 65535 ] || fail "$label must be between 1 and 65535."
+}
+
 [ "$(id -u)" -eq 0 ] || fail 'Run as root.'
 [ -f /etc/alpine-release ] || fail 'This installer supports Alpine Linux only.'
 command -v apk >/dev/null 2>&1 || fail 'apk is required.'
@@ -39,6 +89,8 @@ IFS= read -r listen_port <&3 || fail 'Could not read listen port.'
 listen_port=${listen_port:-$public_port}
 server_name=
 ws_path=
+cdn_domain=
+cdn_port=443
 default_name=NAT-VLESS
 if [ "$node_type" = 1 ]; then
   printf 'REALITY SNI [%s]: ' "$DEFAULT_SNI" >/dev/tty
@@ -46,7 +98,8 @@ if [ "$node_type" = 1 ]; then
   server_name=${server_name:-$DEFAULT_SNI}
 else
   default_name=NAT-VLESS-WS
-  printf 'CDN mode: no domain/certificate setup; an HTTP WebSocket path will be generated.\n' >/dev/tty
+  printf 'CDN domain (SNI and WebSocket Host): ' >/dev/tty
+  IFS= read -r cdn_domain <&3 || fail 'Could not read CDN domain.'
 fi
 printf 'Node name [%s]: ' "$default_name" >/dev/tty
 IFS= read -r node_name <&3 || fail 'Could not read node name.'
@@ -54,16 +107,14 @@ node_name=${node_name:-$default_name}
 exec 3<&-
 
 [ -n "$public_host" ] || fail 'Public host is required.'
-printf '%s' "$public_host" | grep -Eq '^([A-Za-z0-9.:-]+|\[[A-Fa-f0-9:]+\])$' \
-  || fail 'Public host must be an IP address or DNS hostname without a scheme or port.'
-for port in "$public_port" "$listen_port"; do
-  printf '%s' "$port" | grep -Eq '^[1-9][0-9]{0,4}$' \
-    || fail 'TCP ports must be numbers between 1 and 65535.'
-  [ "$port" -le 65535 ] || fail 'TCP ports must be between 1 and 65535.'
-done
+validate_host "$public_host" 'Origin public host'
+validate_port "$public_port" 'Provider-mapped public TCP port'
+validate_port "$listen_port" 'Local listen port'
 [ "$listen_port" -ge 1024 ] || fail 'Local listen port must be at least 1024 when running as nobody.'
 if [ "$node_type" = 1 ]; then
-  printf '%s' "$server_name" | grep -Eq '^[A-Za-z0-9.-]+$' || fail 'Invalid SNI hostname.'
+  validate_hostname "$server_name" 'REALITY SNI'
+else
+  validate_hostname "$cdn_domain" 'CDN domain'
 fi
 
 listen_address=0.0.0.0
@@ -167,6 +218,7 @@ esac
 encoded_name=$(jq -nr --arg value "$node_name" '$value | @uri')
 if [ "$node_type" = 2 ]; then
   encoded_path=$(jq -nr --arg value "$ws_path" '$value | @uri')
+  encoded_domain=$(jq -nr --arg value "$cdn_domain" '$value | @uri')
 fi
 # Clean both the release archive and temporary packages after successful start.
 rm -rf "$tmp_dir"
@@ -177,12 +229,17 @@ if [ "$node_type" = 1 ]; then
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
     "$uuid" "$public_host" "$public_port" "$server_name" "$public_key" "$short_id" "$encoded_name"
 else
-  printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&path=%s#%s\n' \
-    "$uuid" "$public_host" "$public_port" "$encoded_path" "$encoded_name"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
+    "$uuid" "$cdn_domain" "$cdn_port" "$encoded_domain" "$encoded_domain" "$encoded_path" "$encoded_name"
   printf '\nWebSocket origin path: %s\n' "$ws_path"
-  printf 'CDN setup is external. This link is an origin template, NOT a TLS/CDN-ready node.\n'
-  printf 'Client: set CDN address/edge port, enable TLS, set your domain as SNI and WS Host; keep UUID and path.\n'
-  printf 'Origin: forward HTTP WebSocket traffic to the mapped public TCP port; no TLS certificate is installed.\n'
+  printf 'CDN-ready client endpoint: %s:%s\n' "$cdn_domain" "$cdn_port"
+  printf 'CDN domain (SNI and WebSocket Host): %s\n' "$cdn_domain"
+  printf 'Origin: forward HTTP WebSocket traffic to %s:%s -> local TCP %s.\n' \
+    "$public_host" "$public_port" "$listen_port"
+  printf 'Enable CDN proxying and WebSocket support for this hostname externally.\n'
+  printf 'No DNS, proxy status, origin rule, or preferred edge IP is changed by this script.\n'
+  printf 'If you select a preferred CDN IP later, replace only the link address; keep SNI and WebSocket Host.\n'
+  printf 'The CDN-to-origin leg remains plaintext HTTP WebSocket; Full (strict) origin TLS is not configured.\n'
   printf 'WARNING: CDN-to-origin traffic is plaintext; a random path is not encryption or a firewall.\n'
 fi
 printf '\nEnsure the provider maps public TCP port %s to local TCP port %s.\n' "$public_port" "$listen_port"
