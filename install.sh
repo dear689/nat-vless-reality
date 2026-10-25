@@ -48,6 +48,54 @@ validate_port() {
     || fail "$label must be between 1 and 65535."
 }
 
+probe_address_family() {
+  local family_flag="$1"
+  local endpoint
+  for endpoint in https://www.cloudflare.com/cdn-cgi/trace https://www.google.com/generate_204; do
+    if curl --disable --noproxy '*' --proto '=https' "$family_flag" \
+      --connect-timeout 3 --max-time 5 --fail --silent --show-error \
+      --output /dev/null "$endpoint" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_address_families() {
+  detected_v4=0
+  detected_v6=0
+  if probe_address_family -4; then detected_v4=1; fi
+  if probe_address_family -6; then detected_v6=1; fi
+}
+
+select_address_family() {
+  local default_family
+  if (( detected_v4 == 1 && detected_v6 == 1 )); then
+    default_family=3
+  elif (( detected_v4 == 1 )); then
+    default_family=1
+  elif (( detected_v6 == 1 )); then
+    default_family=2
+  else
+    fail "No working IPv4 or IPv6 HTTPS egress. Check DNS, connectivity, and system time."
+  fi
+  printf '检测到的外网出口：\n  IPv4：%s\n  IPv6：%s\n' \
+    "$([[ "$detected_v4" == 1 ]] && printf 可用 || printf 不可用)" \
+    "$([[ "$detected_v6" == 1 ]] && printf 可用 || printf 不可用)"
+  while :; do
+    printf '节点出站方式：\n  1) 仅 IPv4\n  2) 仅 IPv6\n  3) 双栈（TCP 优先 IPv6，IPv4 回退）\n请选择 [%s]：' "$default_family"
+    read -r -u 3 address_family || fail "Could not read address family."
+    address_family="${address_family:-$default_family}"
+    case "$address_family" in
+      1) [[ "$detected_v4" == 1 ]] && break ;;
+      2) [[ "$detected_v6" == 1 ]] && break ;;
+      3) [[ "$detected_v4" == 1 && "$detected_v6" == 1 ]] && break ;;
+      *) printf '请输入 1、2 或 3。\n'; continue ;;
+    esac
+    printf '该选项需要对应的外网连接可用，请重新选择。\n'
+  done
+}
+
 [[ "${EUID}" -eq 0 ]] || fail "Run this script as root."
 [[ -f /etc/os-release ]] || fail "Cannot identify the operating system."
 [[ -d /run/systemd/system ]] || fail "This script requires systemd."
@@ -60,13 +108,19 @@ fi
 if ! exec 3</dev/tty; then
   fail "An interactive terminal is required for port mapping details."
 fi
-printf 'Node type:\n  1) VLESS + REALITY + TCP (direct)\n  2) VLESS + WebSocket (plain HTTP origin for external CDN)\n'
-read -r -u 3 -p "Choose [1]: " node_type
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl
+printf '正在检测 IPv4 和 IPv6 的外网 HTTPS 连通性（最长约 20 秒）...\n'
+detect_address_families
+select_address_family
+printf '节点类型：\n  1) VLESS + REALITY + TCP（直连）\n  2) VLESS + WebSocket（供外部 CDN 回源的明文 HTTP）\n'
+read -r -u 3 -p "请选择 [1]： " node_type
 node_type="${node_type:-1}"
-[[ "$node_type" == 1 || "$node_type" == 2 ]] || fail "Choose node type 1 or 2."
-read -r -u 3 -p "Public IP or hostname: " public_host
-read -r -u 3 -p "Provider-mapped public TCP port: " public_port
-read -r -u 3 -p "Local listen port [${public_port}]: " listen_port
+[[ "$node_type" == 1 || "$node_type" == 2 ]] || fail "节点类型只能选择 1 或 2。"
+read -r -u 3 -p "公网 IP 或域名（客户端/CDN 入口，与出站方式无关）： " public_host
+read -r -u 3 -p "服务商映射的公网 TCP 端口： " public_port
+read -r -u 3 -p "本机监听端口 [${public_port}]： " listen_port
 listen_port="${listen_port:-$public_port}"
 server_name=""
 ws_path=""
@@ -74,24 +128,24 @@ cdn_domain=""
 cdn_port="443"
 default_name="NAT-VLESS"
 if [[ "$node_type" == 1 ]]; then
-  read -r -u 3 -p "REALITY SNI [${DEFAULT_SNI}]: " server_name
+  read -r -u 3 -p "REALITY SNI [${DEFAULT_SNI}]： " server_name
   server_name="${server_name:-$DEFAULT_SNI}"
 else
   default_name="NAT-VLESS-WS"
-  read -r -u 3 -p "CDN domain (SNI and WebSocket Host): " cdn_domain
+  read -r -u 3 -p "CDN 域名（SNI 和 WebSocket Host）： " cdn_domain
 fi
-read -r -u 3 -p "Node name [${default_name}]: " node_name
+read -r -u 3 -p "节点名称 [${default_name}]： " node_name
 node_name="${node_name:-$default_name}"
 exec 3<&-
 
-[[ -n "$public_host" ]] || fail "Public host is required."
-validate_host "$public_host" "Origin public host"
-validate_port "$public_port" "Provider-mapped public TCP port"
-validate_port "$listen_port" "Local listen port"
+[[ -n "$public_host" ]] || fail "公网 IP 或域名不能为空。"
+validate_host "$public_host" "公网 IP 或域名"
+validate_port "$public_port" "服务商映射的公网 TCP 端口"
+validate_port "$listen_port" "本机监听端口"
 if [[ "$node_type" == 1 ]]; then
   validate_hostname "$server_name" "REALITY SNI"
 else
-  validate_hostname "$cdn_domain" "CDN domain"
+  validate_hostname "$cdn_domain" "CDN 域名"
 fi
 listen_address="0.0.0.0"
 if [[ "$public_host" == *:* ]]; then
@@ -102,9 +156,7 @@ if command -v ss >/dev/null 2>&1 && ss -Hltn "sport = :${listen_port}" | grep -q
   fail "Local TCP port ${listen_port} is already in use."
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl openssl python3
+apt-get install -y --no-install-recommends openssl python3
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -129,6 +181,7 @@ else
 fi
 
 export XRAY_NODE_TYPE="$node_type"
+export XRAY_ADDRESS_FAMILY="$address_family"
 export XRAY_WS_PATH="$ws_path"
 export XRAY_PRIVATE_KEY="$private_key"
 export XRAY_UUID="$uuid"
@@ -166,6 +219,20 @@ else:
         "wsSettings": {"path": os.environ["XRAY_WS_PATH"]},
     }
 
+family = os.environ["XRAY_ADDRESS_FAMILY"]
+sockopt = {"domainStrategy": {"1": "ForceIPv4", "2": "ForceIPv6", "3": "UseIP"}[family]}
+outbound_settings = {}
+if family == "3":
+    sockopt["happyEyeballs"] = {
+        "tryDelayMs": 250, "prioritizeIPv6": True, "interleave": 1, "maxConcurrentTry": 2,
+    }
+else:
+    # ForceIPv* resolves domains; finalRules also restrict literal and UDP targets.
+    outbound_settings["finalRules"] = [{
+        "action": "block", "ip": ["::/0" if family == "1" else "0.0.0.0/0"],
+        "blockDelay": "0",
+    }]
+
 config = {
     "log": {"loglevel": "warning"},
     "inbounds": [{
@@ -178,7 +245,10 @@ config = {
         },
         "streamSettings": stream_settings,
     }],
-    "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+    "outbounds": [{
+        "protocol": "freedom", "tag": "direct", "settings": outbound_settings,
+        "streamSettings": {"sockopt": sockopt},
+    }],
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
@@ -233,37 +303,30 @@ else:
         "host": os.environ["XRAY_CDN_DOMAIN"],
         "path": os.environ["XRAY_WS_PATH"],
     })
-print("\nXray service is active.")
-print("VLESS link (copy into your client):")
+print("\nXray 服务已启动。")
+print("节点出站方式：" + {
+    "1": "仅 IPv4", "2": "仅 IPv6", "3": "双栈（TCP 优先 IPv6，IPv4 回退）",
+}[os.environ["XRAY_ADDRESS_FAMILY"]])
+print("VLESS 链接（复制到客户端）：")
 print(
-    "vless://"
-    + os.environ["XRAY_UUID"]
-    + "@"
-    + host
-    + ":"
-    + (
-        os.environ["XRAY_PUBLIC_PORT"]
-        if os.environ["XRAY_NODE_TYPE"] == "1"
-        else os.environ["XRAY_CDN_PORT"]
-    )
-    + "?"
-    + params
-    + "#"
-    + name
+    "vless://" + os.environ["XRAY_UUID"] + "@" + host + ":"
+    + (os.environ["XRAY_PUBLIC_PORT"] if os.environ["XRAY_NODE_TYPE"] == "1"
+       else os.environ["XRAY_CDN_PORT"])
+    + "?" + params + "#" + name
 )
 if os.environ["XRAY_NODE_TYPE"] == "2":
-    print("\nWebSocket origin path: " + os.environ["XRAY_WS_PATH"])
-    print("CDN-ready client endpoint: " + host + ":" + os.environ["XRAY_CDN_PORT"])
-    print("CDN domain (SNI and WebSocket Host): " + os.environ["XRAY_CDN_DOMAIN"])
-    print("Origin: forward HTTP WebSocket traffic to "
+    print("\nWebSocket 回源路径：" + os.environ["XRAY_WS_PATH"])
+    print("CDN 客户端入口：" + host + ":" + os.environ["XRAY_CDN_PORT"])
+    print("CDN 域名（SNI 和 WebSocket Host）：" + os.environ["XRAY_CDN_DOMAIN"])
+    print("回源：将 HTTP WebSocket 转发到 "
           + origin_host + ":" + os.environ["XRAY_PUBLIC_PORT"]
-          + " -> local TCP " + os.environ["XRAY_LISTEN_PORT"] + ".")
-    print("Enable CDN proxying and WebSocket support for this hostname externally.")
-    print("No DNS, proxy status, origin rule, or preferred edge IP is changed by this script.")
-    print("If you select a preferred CDN IP later, replace only the link address; keep SNI and WebSocket Host.")
-    print("The CDN-to-origin leg remains plaintext HTTP WebSocket; Full (strict) origin TLS is not configured.")
-    print("WARNING: CDN-to-origin traffic is plaintext; a random path is not encryption or a firewall.")
-print("\nEnsure the provider maps the public TCP port to local TCP port "
+          + " -> 本机 TCP " + os.environ["XRAY_LISTEN_PORT"] + "。")
+    print("请在外部开启该域名的 CDN 代理和 WebSocket。")
+    print("本脚本不会修改 DNS、代理状态、回源规则或优选 IP。")
+    print("如果之后使用优选 CDN IP，只替换链接中的地址，SNI 和 WebSocket Host 保持不变。")
+    print("CDN 到源站仍是明文 HTTP WebSocket；本脚本没有配置源站证书或 Full（严格）模式。")
+    print("警告：CDN 到源站的链路是明文，随机路径不是加密或防火墙。")
+print("\n请确认服务商已将公网 TCP 端口映射到本机 TCP 端口 "
       + os.environ["XRAY_LISTEN_PORT"]
-      + ". This script does not change provider port mappings or firewall rules.")
+      + "。本脚本不会修改服务商端口映射或防火墙规则。")
 PY
