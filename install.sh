@@ -96,6 +96,18 @@ select_address_family() {
   done
 }
 
+select_node_type() {
+  while :; do
+    printf '节点类型：\n  1) 仅直连 VLESS + REALITY\n  2) 仅 CDN VLESS + WebSocket\n  3) 直连 + CDN（同时运行）\n  4) 直连 + Argo 隧道（Cloudflare Tunnel，同时运行）\n'
+    read -r -u 3 -p "请选择 [1]： " node_type || fail "无法读取节点类型。"
+    node_type="${node_type:-1}"
+    case "$node_type" in
+      1|2|3|4) break ;;
+      *) printf '请输入 1、2、3 或 4。\n' ;;
+    esac
+  done
+}
+
 [[ "${EUID}" -eq 0 ]] || fail "Run this script as root."
 [[ -f /etc/os-release ]] || fail "Cannot identify the operating system."
 [[ -d /run/systemd/system ]] || fail "This script requires systemd."
@@ -114,25 +126,51 @@ apt-get install -y --no-install-recommends ca-certificates curl
 printf '正在检测 IPv4 和 IPv6 的外网 HTTPS 连通性（最长约 20 秒）...\n'
 detect_address_families
 select_address_family
-printf '节点类型：\n  1) VLESS + REALITY + TCP（直连）\n  2) VLESS + WebSocket（供外部 CDN 回源的明文 HTTP）\n'
-read -r -u 3 -p "请选择 [1]： " node_type
-node_type="${node_type:-1}"
-[[ "$node_type" == 1 || "$node_type" == 2 ]] || fail "节点类型只能选择 1 或 2。"
+select_node_type
 read -r -u 3 -p "公网 IP 或域名（客户端/CDN 入口，与出站方式无关）： " public_host
-read -r -u 3 -p "服务商映射的公网 TCP 端口： " public_port
-read -r -u 3 -p "本机监听端口 [${public_port}]： " listen_port
-listen_port="${listen_port:-$public_port}"
+direct_public_port=""
+direct_listen_port=""
+ws_public_port=""
+ws_listen_port=""
+if [[ "$node_type" != 2 ]]; then
+  read -r -u 3 -p "直连服务商映射的公网 TCP 端口： " direct_public_port
+  read -r -u 3 -p "直连本机监听端口 [${direct_public_port}]： " direct_listen_port
+  direct_listen_port="${direct_listen_port:-$direct_public_port}"
+fi
 server_name=""
 ws_path=""
 cdn_domain=""
 cdn_port="443"
+argo_token=""
 default_name="NAT-VLESS"
-if [[ "$node_type" == 1 ]]; then
+if [[ "$node_type" == 1 || "$node_type" == 3 || "$node_type" == 4 ]]; then
   read -r -u 3 -p "REALITY SNI [${DEFAULT_SNI}]： " server_name
   server_name="${server_name:-$DEFAULT_SNI}"
-else
-  default_name="NAT-VLESS-WS"
+fi
+if [[ "$node_type" == 2 || "$node_type" == 3 ]]; then
+  if [[ "$node_type" == 2 ]]; then default_name="NAT-VLESS-WS"; fi
   read -r -u 3 -p "CDN 域名（SNI 和 WebSocket Host）： " cdn_domain
+fi
+if [[ "$node_type" == 2 ]]; then
+  read -r -u 3 -p "CDN 回源服务商映射的公网 TCP 端口： " ws_public_port
+  read -r -u 3 -p "CDN 回源本机监听端口 [${ws_public_port}]： " ws_listen_port
+  ws_listen_port="${ws_listen_port:-$ws_public_port}"
+fi
+if [[ "$node_type" == 3 ]]; then
+  read -r -u 3 -p "CDN 回源服务商映射的公网 TCP 端口： " ws_public_port
+  read -r -u 3 -p "CDN 回源本机监听端口 [${ws_public_port}]： " ws_listen_port
+  ws_listen_port="${ws_listen_port:-$ws_public_port}"
+fi
+if [[ "$node_type" == 4 ]]; then
+  default_name="NAT-VLESS"
+  printf '提示：Argo 隧道会额外运行 cloudflared，128 MB 机器尚未验证内存余量。\n'
+  read -r -u 3 -p "Tunnel 域名（Cloudflare Tunnel 中已配置的公开主机名）： " cdn_domain
+  printf '粘贴 Cloudflare Tunnel Token（输入不回显）： ' >/dev/tty
+  IFS= read -r -s -u 3 argo_token || fail "Could not read Cloudflare Tunnel token."
+  printf '\n' >/dev/tty
+  ws_listen_port="2096"
+  read -r -u 3 -p "Tunnel 回源本机监听端口 [${ws_listen_port}]： " input_ws_port
+  ws_listen_port="${input_ws_port:-$ws_listen_port}"
 fi
 read -r -u 3 -p "节点名称 [${default_name}]： " node_name
 node_name="${node_name:-$default_name}"
@@ -140,21 +178,50 @@ exec 3<&-
 
 [[ -n "$public_host" ]] || fail "公网 IP 或域名不能为空。"
 validate_host "$public_host" "公网 IP 或域名"
-validate_port "$public_port" "服务商映射的公网 TCP 端口"
-validate_port "$listen_port" "本机监听端口"
-if [[ "$node_type" == 1 ]]; then
+if [[ "$node_type" != 2 ]]; then
+  validate_port "$direct_public_port" "直连服务商映射的公网 TCP 端口"
+  validate_port "$direct_listen_port" "直连本机监听端口"
+fi
+if [[ "$node_type" == 1 || "$node_type" == 3 || "$node_type" == 4 ]]; then
   validate_hostname "$server_name" "REALITY SNI"
-else
+fi
+if [[ "$node_type" == 2 || "$node_type" == 3 || "$node_type" == 4 ]]; then
   validate_hostname "$cdn_domain" "CDN 域名"
+fi
+if [[ "$node_type" == 2 || "$node_type" == 3 ]]; then
+  validate_port "$ws_public_port" "CDN 回源服务商映射的公网 TCP 端口"
+  validate_port "$ws_listen_port" "CDN 回源本机监听端口"
+  if [[ "$node_type" == 3 ]]; then
+    [[ "$ws_public_port" != "$direct_public_port" ]] \
+      || fail "直连和 CDN 回源不能使用同一个公网映射端口。"
+    [[ "$ws_listen_port" != "$direct_listen_port" ]] \
+      || fail "直连和 WebSocket 不能监听同一个本机端口。"
+  fi
+fi
+if [[ "$node_type" == 4 ]]; then
+  validate_port "$ws_listen_port" "Tunnel 回源本机监听端口"
+  [[ "$ws_listen_port" != "$direct_listen_port" ]] \
+    || fail "直连和 Tunnel WebSocket 不能监听同一个本机端口。"
+  [[ -n "$argo_token" && "$argo_token" != *[[:space:]]* ]] \
+    || fail "Cloudflare Tunnel Token 不能为空或包含空白字符。"
+  [[ ! -e /etc/nat-vless && ! -L /etc/nat-vless \
+      && ! -e /etc/systemd/system/cloudflared-nat-vless.service \
+      && ! -L /etc/systemd/system/cloudflared-nat-vless.service ]] \
+    || fail "已有 NAT VLESS 隧道配置或服务，拒绝覆盖。"
 fi
 listen_address="0.0.0.0"
 if [[ "$public_host" == *:* ]]; then
   listen_address="::"
 fi
 
-if command -v ss >/dev/null 2>&1 && ss -Hltn "sport = :${listen_port}" | grep -q .; then
-  fail "Local TCP port ${listen_port} is already in use."
-fi
+check_ports=()
+if [[ "$node_type" != 2 ]]; then check_ports+=("$direct_listen_port"); fi
+if [[ "$node_type" != 1 ]]; then check_ports+=("$ws_listen_port"); fi
+for check_port in "${check_ports[@]}"; do
+  if command -v ss >/dev/null 2>&1 && ss -Hltn "sport = :${check_port}" | grep -q .; then
+    fail "Local TCP port ${check_port} is already in use."
+  fi
+done
 
 apt-get install -y --no-install-recommends openssl python3
 
@@ -170,54 +237,85 @@ uuid="$("$XRAY_BIN" uuid)"
 private_key=""
 public_key=""
 short_id=""
-if [[ "$node_type" == 1 ]]; then
+direct_enabled=0
+ws_enabled=0
+if [[ "$node_type" == 1 || "$node_type" == 3 || "$node_type" == 4 ]]; then
+  direct_enabled=1
   key_output="$("$XRAY_BIN" x25519)"
   private_key="$(printf '%s\n' "$key_output" | sed -nE 's/^Private ?[Kk]ey:[[:space:]]*//p' | head -n 1)"
   public_key="$(printf '%s\n' "$key_output" | sed -nE 's/^(Password( \(PublicKey\))?|Public ?[Kk]ey):[[:space:]]*//p' | head -n 1)"
   [[ -n "$private_key" && -n "$public_key" ]] || fail "Could not parse the Xray REALITY keypair."
   short_id="$(openssl rand -hex 8)"
-else
+fi
+if [[ "$node_type" == 2 || "$node_type" == 3 || "$node_type" == 4 ]]; then
+  ws_enabled=1
   ws_path="/ws-$(openssl rand -hex 8)"
 fi
 
 export XRAY_NODE_TYPE="$node_type"
+export XRAY_DIRECT_ENABLED="$direct_enabled"
+export XRAY_WS_ENABLED="$ws_enabled"
 export XRAY_ADDRESS_FAMILY="$address_family"
 export XRAY_WS_PATH="$ws_path"
 export XRAY_PRIVATE_KEY="$private_key"
 export XRAY_UUID="$uuid"
 export XRAY_SHORT_ID="$short_id"
-export XRAY_LISTEN_PORT="$listen_port"
+export XRAY_DIRECT_LISTEN_PORT="$direct_listen_port"
+export XRAY_WS_LISTEN_PORT="$ws_listen_port"
 export XRAY_LISTEN_ADDRESS="$listen_address"
 export XRAY_SERVER_NAME="$server_name"
 export XRAY_CDN_DOMAIN="$cdn_domain"
 export XRAY_CDN_PORT="$cdn_port"
+export XRAY_WS_PUBLIC_PORT="$ws_public_port"
 python3 - "$tmp_dir/config.json" <<'PY'
 import json
 import os
 import sys
 
-reality = os.environ["XRAY_NODE_TYPE"] == "1"
-client = {"id": os.environ["XRAY_UUID"]}
-if reality:
-    client["flow"] = "xtls-rprx-vision"
-    stream_settings = {
-        "network": "raw",
-        "security": "reality",
-        "realitySettings": {
-            "show": False,
-            "target": os.environ["XRAY_SERVER_NAME"] + ":443",
-            "xver": 0,
-            "serverNames": [os.environ["XRAY_SERVER_NAME"]],
-            "privateKey": os.environ["XRAY_PRIVATE_KEY"],
-            "shortIds": [os.environ["XRAY_SHORT_ID"]],
+direct_enabled = os.environ["XRAY_DIRECT_ENABLED"] == "1"
+ws_enabled = os.environ["XRAY_WS_ENABLED"] == "1"
+inbounds = []
+if direct_enabled:
+    inbounds.append({
+        "listen": os.environ["XRAY_LISTEN_ADDRESS"],
+        "port": int(os.environ["XRAY_DIRECT_LISTEN_PORT"]),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": os.environ["XRAY_UUID"], "flow": "xtls-rprx-vision"}],
+            "decryption": "none",
         },
-    }
-else:
-    stream_settings = {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {"path": os.environ["XRAY_WS_PATH"]},
-    }
+        "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "target": os.environ["XRAY_SERVER_NAME"] + ":443",
+                "xver": 0,
+                "serverNames": [os.environ["XRAY_SERVER_NAME"]],
+                "privateKey": os.environ["XRAY_PRIVATE_KEY"],
+                "shortIds": [os.environ["XRAY_SHORT_ID"]],
+            },
+        },
+    })
+if ws_enabled:
+    ws_listen_address = (
+        "127.0.0.1" if os.environ["XRAY_NODE_TYPE"] == "4"
+        else os.environ["XRAY_LISTEN_ADDRESS"]
+    )
+    inbounds.append({
+        "listen": ws_listen_address,
+        "port": int(os.environ["XRAY_WS_LISTEN_PORT"]),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": os.environ["XRAY_UUID"]}],
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": os.environ["XRAY_WS_PATH"]},
+        },
+    })
 
 family = os.environ["XRAY_ADDRESS_FAMILY"]
 sockopt = {"domainStrategy": {"1": "ForceIPv4", "2": "ForceIPv6", "3": "UseIP"}[family]}
@@ -235,16 +333,7 @@ else:
 
 config = {
     "log": {"loglevel": "warning"},
-    "inbounds": [{
-        "listen": os.environ["XRAY_LISTEN_ADDRESS"],
-        "port": int(os.environ["XRAY_LISTEN_PORT"]),
-        "protocol": "vless",
-        "settings": {
-            "clients": [client],
-            "decryption": "none",
-        },
-        "streamSettings": stream_settings,
-    }],
+    "inbounds": inbounds,
     "outbounds": [{
         "protocol": "freedom", "tag": "direct", "settings": outbound_settings,
         "streamSettings": {"sockopt": sockopt},
@@ -258,6 +347,33 @@ PY
 if [[ -e "$XRAY_CONFIG" && "$(tr -d '[:space:]' < "$XRAY_CONFIG")" != '{}' ]]; then
   fail "The installer created an unexpected config; refusing to overwrite it."
 fi
+cloudflared_bin=""
+if [[ "$node_type" == 4 ]]; then
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    install -d -m 755 /usr/share/keyrings
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+      -o /usr/share/keyrings/cloudflare-main.gpg
+    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
+      > /etc/apt/sources.list.d/cloudflared.list
+    apt-get update
+    apt-get install -y --no-install-recommends cloudflared
+  fi
+  cloudflared_bin="$(command -v cloudflared)" || fail "cloudflared was not installed."
+  "$cloudflared_bin" tunnel run --help | grep -F -- '--token-file' >/dev/null \
+    || fail "现有 cloudflared 不支持 --token-file，请先升级后重试。"
+  if ! getent group cloudflared >/dev/null 2>&1; then
+    addgroup --system cloudflared
+  fi
+  if ! getent passwd cloudflared >/dev/null 2>&1; then
+    adduser --system --no-create-home --ingroup cloudflared \
+      --home /nonexistent --shell /usr/sbin/nologin cloudflared
+  fi
+  install -d -m 750 -o root -g cloudflared /etc/nat-vless
+  printf '%s' "$argo_token" > "$tmp_dir/cloudflared-token"
+  install -m 640 -o root -g cloudflared \
+    "$tmp_dir/cloudflared-token" /etc/nat-vless/cloudflared.token
+  unset argo_token
+fi
 service_user="$(systemctl show -p User --value xray.service)"
 [[ -n "$service_user" ]] && id "$service_user" >/dev/null 2>&1 \
   || fail "Could not determine the Xray systemd service user."
@@ -266,9 +382,43 @@ install -m 600 -o "$service_user" -g "$service_group" "$tmp_dir/config.json" "$X
 systemctl enable xray.service
 systemctl restart xray.service
 systemctl is-active --quiet xray.service || fail "Xray did not start; inspect: journalctl -u xray -n 50"
+if [[ "$node_type" == 4 ]]; then
+  cat > /etc/systemd/system/cloudflared-nat-vless.service <<UNIT
+[Unit]
+Description=Cloudflare Tunnel for NAT VLESS WebSocket
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+ExecStart=${cloudflared_bin} tunnel --edge-ip-version auto --no-autoupdate run --token-file /etc/nat-vless/cloudflared.token
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 644 /etc/systemd/system/cloudflared-nat-vless.service
+  systemctl daemon-reload
+  systemctl enable --now cloudflared-nat-vless.service
+  systemctl is-active --quiet cloudflared-nat-vless.service \
+    || fail "Cloudflare Tunnel did not start; inspect journalctl -u cloudflared-nat-vless."
+fi
 
 export XRAY_PUBLIC_HOST="$public_host"
-export XRAY_PUBLIC_PORT="$public_port"
+export XRAY_DIRECT_PUBLIC_PORT="$direct_public_port"
+export XRAY_WS_PUBLIC_PORT="$ws_public_port"
 export XRAY_PUBLIC_KEY="$public_key"
 export XRAY_NODE_NAME="$node_name"
 python3 <<'PY'
@@ -281,10 +431,21 @@ def format_host(value):
     return value
 
 origin_host = format_host(os.environ["XRAY_PUBLIC_HOST"])
-host = origin_host
-name = quote(os.environ["XRAY_NODE_NAME"], safe="-._~")
-if os.environ["XRAY_NODE_TYPE"] == "1":
-    params = urlencode({
+node_type = os.environ["XRAY_NODE_TYPE"]
+base_name = os.environ["XRAY_NODE_NAME"]
+direct_enabled = os.environ["XRAY_DIRECT_ENABLED"] == "1"
+ws_enabled = os.environ["XRAY_WS_ENABLED"] == "1"
+
+def make_link(host, port, params, label):
+    name = quote(label, safe="-._~")
+    return "vless://" + os.environ["XRAY_UUID"] + "@" + host + ":" + port + "?" + params + "#" + name
+
+print("\nXray 服务已启动。")
+print("节点出站方式：" + {
+    "1": "仅 IPv4", "2": "仅 IPv6", "3": "双栈（TCP 优先 IPv6，IPv4 回退）",
+}[os.environ["XRAY_ADDRESS_FAMILY"]])
+if direct_enabled:
+    direct_params = urlencode({
         "encryption": "none",
         "flow": "xtls-rprx-vision",
         "security": "reality",
@@ -294,39 +455,49 @@ if os.environ["XRAY_NODE_TYPE"] == "1":
         "sid": os.environ["XRAY_SHORT_ID"],
         "type": "tcp",
     })
-else:
-    host = os.environ["XRAY_CDN_DOMAIN"]
-    params = urlencode({
+    direct_label = base_name if not ws_enabled else base_name + "-Direct"
+    print("\n直连 VLESS 链接：")
+    print(make_link(
+        origin_host, os.environ["XRAY_DIRECT_PUBLIC_PORT"], direct_params, direct_label
+    ))
+if ws_enabled:
+    tunnel_domain = os.environ["XRAY_CDN_DOMAIN"]
+    ws_params = urlencode({
         "encryption": "none", "security": "tls",
-        "sni": os.environ["XRAY_CDN_DOMAIN"],
+        "sni": tunnel_domain,
         "fp": "chrome", "type": "ws",
-        "host": os.environ["XRAY_CDN_DOMAIN"],
+        "host": tunnel_domain,
         "path": os.environ["XRAY_WS_PATH"],
     })
-print("\nXray 服务已启动。")
-print("节点出站方式：" + {
-    "1": "仅 IPv4", "2": "仅 IPv6", "3": "双栈（TCP 优先 IPv6，IPv4 回退）",
-}[os.environ["XRAY_ADDRESS_FAMILY"]])
-print("VLESS 链接（复制到客户端）：")
-print(
-    "vless://" + os.environ["XRAY_UUID"] + "@" + host + ":"
-    + (os.environ["XRAY_PUBLIC_PORT"] if os.environ["XRAY_NODE_TYPE"] == "1"
-       else os.environ["XRAY_CDN_PORT"])
-    + "?" + params + "#" + name
-)
-if os.environ["XRAY_NODE_TYPE"] == "2":
-    print("\nWebSocket 回源路径：" + os.environ["XRAY_WS_PATH"])
-    print("CDN 客户端入口：" + host + ":" + os.environ["XRAY_CDN_PORT"])
+    ws_label = base_name if not direct_enabled else base_name + (
+        "-Tunnel" if node_type == "4" else "-CDN"
+    )
+    print("\nWebSocket VLESS 链接：")
+    print(make_link(tunnel_domain, os.environ["XRAY_CDN_PORT"], ws_params, ws_label))
+    print("WebSocket 回源路径：" + os.environ["XRAY_WS_PATH"])
+if node_type in ("2", "3"):
     print("CDN 域名（SNI 和 WebSocket Host）：" + os.environ["XRAY_CDN_DOMAIN"])
     print("回源：将 HTTP WebSocket 转发到 "
-          + origin_host + ":" + os.environ["XRAY_PUBLIC_PORT"]
-          + " -> 本机 TCP " + os.environ["XRAY_LISTEN_PORT"] + "。")
+          + origin_host + ":" + os.environ["XRAY_WS_PUBLIC_PORT"]
+          + " -> 本机 TCP " + os.environ["XRAY_WS_LISTEN_PORT"] + "。")
     print("请在外部开启该域名的 CDN 代理和 WebSocket。")
     print("本脚本不会修改 DNS、代理状态、回源规则或优选 IP。")
     print("如果之后使用优选 CDN IP，只替换链接中的地址，SNI 和 WebSocket Host 保持不变。")
     print("CDN 到源站仍是明文 HTTP WebSocket；本脚本没有配置源站证书或 Full（严格）模式。")
     print("警告：CDN 到源站的链路是明文，随机路径不是加密或防火墙。")
-print("\n请确认服务商已将公网 TCP 端口映射到本机 TCP 端口 "
-      + os.environ["XRAY_LISTEN_PORT"]
-      + "。本脚本不会修改服务商端口映射或防火墙规则。")
+if node_type == "4":
+    print("请在 Cloudflare Tunnel 路由中将 " + tunnel_domain
+          + " 指向 http://127.0.0.1:" + os.environ["XRAY_WS_LISTEN_PORT"] + "。")
+    print("Cloudflare Tunnel 需要服务器允许出站访问 TCP 或 UDP 7844。")
+    print("Token 已保存为 root/服务组可读文件；不会显示在节点链接或 unit 命令行中。")
+if node_type != "2":
+    print("\n直连映射：公网 TCP " + os.environ["XRAY_DIRECT_PUBLIC_PORT"]
+          + " -> 本机 TCP " + os.environ["XRAY_DIRECT_LISTEN_PORT"] + "。")
+if node_type == "2":
+    print("\nCDN 映射：公网 TCP " + os.environ["XRAY_WS_PUBLIC_PORT"]
+          + " -> 本机 TCP " + os.environ["XRAY_WS_LISTEN_PORT"] + "。")
+elif node_type == "3":
+    print("CDN 映射：公网 TCP " + os.environ["XRAY_WS_PUBLIC_PORT"]
+          + " -> 本机 TCP " + os.environ["XRAY_WS_LISTEN_PORT"] + "。")
+print("本脚本不会修改服务商端口映射、DNS 或 Cloudflare 外部路由。")
 PY

@@ -34,21 +34,27 @@ FAMILY_STRATEGIES = {"1": "ForceIPv4", "2": "ForceIPv6", "3": "UseIP"}
 
 
 def variables(mode, host="198.51.100.20", address_family="3", listen_address=None):
+    direct = mode in ("1", "3", "4")
+    ws = mode in ("2", "3", "4")
     return {
         "node_type": mode,
+        "direct_enabled": "1" if direct else "0",
+        "ws_enabled": "1" if ws else "0",
         "address_family": address_family,
         "public_host": host,
-        "public_port": "30860",
-        "listen_port": "31001",
+        "direct_public_port": "30860" if direct else "",
+        "direct_listen_port": "31001" if direct else "",
+        "ws_public_port": "30860" if mode == "2" else ("30861" if mode == "3" else ""),
+        "ws_listen_port": "31001" if mode == "2" else ("31002" if ws else ""),
         "listen_address": listen_address or ("::" if ":" in host else "0.0.0.0"),
         "uuid": UUID,
-        "private_key": KEY if mode == "1" else "",
-        "public_key": KEY if mode == "1" else "",
-        "short_id": SID if mode == "1" else "",
-        "server_name": "gateway.icloud.com" if mode == "1" else "",
-        "ws_path": WS_PATH if mode == "2" else "",
-        "cdn_domain": "cdn.example.com" if mode == "2" else "",
-        "cdn_port": "443" if mode == "2" else "",
+        "private_key": KEY if direct else "",
+        "public_key": KEY if direct else "",
+        "short_id": SID if direct else "",
+        "server_name": "gateway.icloud.com" if direct else "",
+        "ws_path": WS_PATH if ws else "",
+        "cdn_domain": "cdn.example.com" if ws else "",
+        "cdn_port": "443" if ws else "",
         "node_name": NAME,
     }
 
@@ -71,11 +77,16 @@ def python_env(values):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     mapping = {
-        "node_type": "NODE_TYPE", "address_family": "ADDRESS_FAMILY", "ws_path": "WS_PATH",
-        "listen_address": "LISTEN_ADDRESS", "listen_port": "LISTEN_PORT",
+        "node_type": "NODE_TYPE", "direct_enabled": "DIRECT_ENABLED",
+        "ws_enabled": "WS_ENABLED", "address_family": "ADDRESS_FAMILY",
+        "ws_path": "WS_PATH", "listen_address": "LISTEN_ADDRESS",
+        "direct_listen_port": "DIRECT_LISTEN_PORT",
+        "ws_listen_port": "WS_LISTEN_PORT",
         "uuid": "UUID", "private_key": "PRIVATE_KEY", "public_key": "PUBLIC_KEY",
         "short_id": "SHORT_ID", "server_name": "SERVER_NAME",
-        "public_host": "PUBLIC_HOST", "public_port": "PUBLIC_PORT",
+        "public_host": "PUBLIC_HOST",
+        "direct_public_port": "DIRECT_PUBLIC_PORT",
+        "ws_public_port": "WS_PUBLIC_PORT",
         "node_name": "NODE_NAME", "cdn_domain": "CDN_DOMAIN",
         "cdn_port": "CDN_PORT",
     }
@@ -100,22 +111,49 @@ def configuration(installer, mode, host="198.51.100.20", address_family="3", lis
         return json.loads(output.read_text(encoding="utf-8"))
 
 
-def link(installer, mode, host, address_family="3"):
+def links(installer, mode, host, address_family="3"):
     values = variables(mode, host, address_family)
     if installer == "alpine":
         start = ALPINE.index('case "$public_host" in\n  *:*) case')
         end = ALPINE.index("# Clean both the release archive", start)
         output_start = ALPINE.index("printf '\\nXray 服务已启动。")
-        output = shell_run(ALPINE[start:end] + ALPINE[output_start:], values)
+        output = shell_run(
+            ALPINE[start:end]
+            + '\njq() { printf "jq was called after dependency cleanup\\n" >&2; return 127; }\n'
+            + ALPINE[output_start:],
+            {
+                **values,
+                "XRAY_DIRECT_ENABLED": values["direct_enabled"],
+                "XRAY_WS_ENABLED": values["ws_enabled"],
+                "XRAY_ADDRESS_FAMILY": address_family,
+                "XRAY_UUID": UUID,
+                "XRAY_CDN_DOMAIN": values["cdn_domain"],
+                "XRAY_CDN_PORT": values["cdn_port"] or "443",
+                "XRAY_WS_PATH": values["ws_path"],
+                "XRAY_DIRECT_PUBLIC_PORT": values["direct_public_port"],
+                "XRAY_WS_PUBLIC_PORT": values["ws_public_port"],
+                "XRAY_DIRECT_LISTEN_PORT": values["direct_listen_port"],
+                "XRAY_WS_LISTEN_PORT": values["ws_listen_port"],
+                "XRAY_SERVER_NAME": values["server_name"],
+                "XRAY_PUBLIC_KEY": values["public_key"],
+                "XRAY_SHORT_ID": values["short_id"],
+                "XRAY_NODE_NAME": values["node_name"],
+            },
+        )
     else:
         output = subprocess.check_output(
             [sys.executable, "-c", PY_BLOCKS[1]],
             env=python_env(values), text=True, encoding="utf-8",
         )
     links = [line for line in output.splitlines() if line.startswith("vless://")]
-    if len(links) != 1:
-        raise AssertionError("Expected exactly one VLESS import link")
-    return links[0]
+    expected_count = 2 if mode in ("3", "4") else 1
+    if len(links) != expected_count:
+        raise AssertionError(f"Expected {expected_count} VLESS import links")
+    return links
+
+
+def link(installer, mode, host, address_family="3"):
+    return links(installer, mode, host, address_family)[0]
 
 
 def shell_function(source, name):
@@ -221,7 +259,9 @@ curl() {
                 self.assertIsNotNone(detection)
                 self.assertIsNotNone(selection)
                 self.assertLess(detection.start(), selection.start())
-                self.assertLess(selection.start(), source.index("\u8282\u70b9\u7c7b\u578b\uff1a"))
+                mode_selection = re.search(r"^select_node_type\s*$", source, re.M)
+                self.assertIsNotNone(mode_selection)
+                self.assertLess(selection.start(), mode_selection.start())
 
     def test_interactive_prompts_are_chinese_and_ordered(self):
         prompts = {
@@ -242,11 +282,39 @@ curl() {
                     self.assertGreaterEqual(
                         positions[name], 0, f"{installer} is missing prompt: {label}"
                     )
-                self.assertLess(positions["egress"], positions["node"])
+                # Both menus live in functions; their call order is checked above.
                 self.assertLess(positions["node"], positions["public_host"])
                 self.assertLess(positions["public_host"], positions["public_port"])
                 self.assertLess(positions["public_port"], positions["listen_port"])
                 self.assertLess(positions["listen_port"], positions["node_name"])
+
+
+class ModeSelectionTests(unittest.TestCase):
+    def test_installation_menu_defaults_choices_and_retries(self):
+        for installer, source in (("alpine", ALPINE), ("debian", DEBIAN)):
+            # Exercise the prompt without requiring a real controlling terminal.
+            function = shell_function(source, "select_node_type").replace(" >/dev/tty", "")
+            for choices, expected in (
+                ("\n", "1"), ("1\n", "1"), ("2\n", "2"), ("3\n", "3"),
+                ("4\n", "4"), ("bad\n0\n5\n3\n", "3"),
+            ):
+                with self.subTest(installer=installer, choices=choices):
+                    output = shell_run(
+                        "set -e\nfail() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+                        + function + "\nexec 3<<'TEST_INPUT'\n"
+                        + choices + "TEST_INPUT\nselect_node_type\n"
+                          'printf "RESULT %s\\n" "$node_type"\n',
+                        {},
+                    )
+                    self.assertIn("RESULT " + expected, output)
+                    for mode in ("1)", "2)", "3)", "4)"):
+                        self.assertIn(mode, output)
+
+    def test_alpine_output_needs_no_removed_dependencies(self):
+        for mode in ("1", "2", "3", "4"):
+            with self.subTest(mode=mode):
+                self.assertEqual(len(links("alpine", mode, "198.51.100.20")),
+                                 2 if mode in ("3", "4") else 1)
 
 
 class GeneratorTests(unittest.TestCase):
@@ -310,6 +378,43 @@ class GeneratorTests(unittest.TestCase):
                     config = configuration(installer, "2", "198.51.100.20", family, "::")
                     self.assertEqual(config["inbounds"][0]["listen"], "::")
 
+    def test_combined_modes_have_separate_inbounds(self):
+        for installer in ("alpine", "debian"):
+            for mode in ("3", "4"):
+                for host in ("198.51.100.20", "2001:db8::20"):
+                    for family in FAMILY_STRATEGIES:
+                        with self.subTest(installer=installer, mode=mode, host=host, family=family):
+                            config = configuration(installer, mode, host, family)
+                            self.assertEqual(config, configuration("alpine", mode, host, family))
+                            direct, ws = config["inbounds"]
+                            self.assertEqual(direct["port"], 31001)
+                            address = "::" if ":" in host else "0.0.0.0"
+                            self.assertEqual(direct["listen"], address)
+                            self.assertEqual(direct["streamSettings"]["security"], "reality")
+                            self.assertEqual(direct["settings"]["clients"][0]["flow"], "xtls-rprx-vision")
+                            self.assertEqual(ws["port"], 31002)
+                            self.assertEqual(ws["listen"], "127.0.0.1" if mode == "4" else address)
+                            self.assertEqual(ws["streamSettings"]["network"], "ws")
+                            self.assertEqual(direct["settings"]["clients"][0]["id"], UUID)
+                            self.assertEqual(ws["settings"]["clients"][0]["id"], UUID)
+                            reference = configuration(installer, "1", host, family)
+                            self.assertEqual(config["outbounds"], reference["outbounds"])
+
+    def test_combined_modes_generate_distinct_import_links(self):
+        for installer in ("alpine", "debian"):
+            for mode, suffix in (("3", "-CDN"), ("4", "-Tunnel")):
+                with self.subTest(installer=installer, mode=mode):
+                    uris = links(installer, mode, "198.51.100.20")
+                    self.assertEqual(uris, links("alpine", mode, "198.51.100.20"))
+                    direct, ws = map(urlsplit, uris)
+                    self.assertEqual(direct.hostname, "198.51.100.20")
+                    self.assertEqual(direct.port, 30860)
+                    self.assertEqual(ws.hostname, "cdn.example.com")
+                    self.assertEqual(ws.port, 443)
+                    self.assertTrue(unquote(direct.fragment).endswith("-Direct"))
+                    self.assertTrue(unquote(ws.fragment).endswith(suffix))
+                    self.assertEqual(parse_qs(ws.query)["type"], ["ws"])
+
     def test_links_and_platform_parity(self):
         for mode in ("1", "2"):
             for host in ("198.51.100.20", "2001:db8::20", "[2001:db8::20]"):
@@ -359,6 +464,14 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("systemctl enable xray.service", DEBIAN)
         self.assertIn("command_user=nobody:$service_group", ALPINE)
         self.assertIn("export GOGC=50", ALPINE)
+        self.assertIn("cloudflared-nat-vless", ALPINE)
+        self.assertIn("--token-file /etc/nat-vless/cloudflared.token", ALPINE)
+        self.assertIn("ProtectSystem=strict", DEBIAN)
+        self.assertIn("--token-file /etc/nat-vless/cloudflared.token", DEBIAN)
+        for source in (ALPINE, DEBIAN):
+            self.assertIn("--edge-ip-version auto", source)
+            self.assertIn("! -e /etc/nat-vless", source)
+            self.assertIn("command -v cloudflared", source)
         self.assertIn("An Xray installation already exists", ALPINE)
         self.assertIn("refusing to overwrite an existing setup", DEBIAN)
 
@@ -480,7 +593,7 @@ def socks_get(port, target, target_port):
 class XrayTests(unittest.TestCase):
     def test_generated_configurations(self):
         for installer in ("alpine", "debian"):
-            for mode in ("1", "2"):
+            for mode in ("1", "2", "3", "4"):
                 for host in ("198.51.100.20", "2001:db8::20"):
                     for family in FAMILY_STRATEGIES:
                         with self.subTest(installer=installer, mode=mode, host=host, family=family):
@@ -555,67 +668,58 @@ class XrayTests(unittest.TestCase):
 
     def test_ws_forwarding(self):
         for installer in ("alpine", "debian"):
-            with self.subTest(installer=installer):
-                config = configuration(installer, "2")
-                server_port, socks_port = free_port(), free_port()
-                config = copy.deepcopy(config)
-                config["log"]["loglevel"] = "debug"
-                config["inbounds"][0].update(listen="127.0.0.1", port=server_port)
-                client = {
-                    "log": {"loglevel": "debug"},
-                    "inbounds": [{
-                        "listen": "127.0.0.1", "port": socks_port,
-                        "protocol": "socks", "settings": {"auth": "noauth"},
-                    }],
-                    "outbounds": [{
-                        "protocol": "vless",
-                        "settings": {"vnext": [{
-                            "address": "127.0.0.1", "port": server_port,
-                            "users": [{"id": UUID, "encryption": "none"}],
-                        }]},
-                        "streamSettings": {
-                            "network": "ws", "security": "none",
-                            "wsSettings": {
-                                "path": WS_PATH, "headers": {"Host": "cdn.example.invalid"},
-                            },
-                        },
-                    }],
-                }
-                origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TraceHandler)
-                # Newer cores block loopback exits; allow only this temporary test target.
-                config["outbounds"][0].setdefault("settings", {})["finalRules"] = [{
-                    "action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"],
-                    "port": str(origin.server_port),
-                }]
-                thread = threading.Thread(target=origin.serve_forever, daemon=True)
-                thread.start()
-                try:
-                    with running_xray(config, server_port), running_xray(client, socks_port):
-                        with socket.create_connection(("127.0.0.1", socks_port), timeout=5) as sock:
-                            sock.sendall(b"\x05\x01\x00")
-                            self.assertEqual(receive_exact(sock, 2), b"\x05\x00")
-                            request = b"\x05\x01\x00\x01\x7f\x00\x00\x01"
-                            sock.sendall(request + struct.pack("!H", origin.server_port))
-                            reply = receive_exact(sock, 4)
-                            self.assertEqual(reply[:2], b"\x05\x00")
-                            address_size = {1: 4, 4: 16}.get(reply[3])
-                            if reply[3] == 3:
-                                address_size = receive_exact(sock, 1)[0]
-                            self.assertIsNotNone(address_size)
-                            receive_exact(sock, address_size + 2)
-                            sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                            response = b""
-                            while b"ws-origin-regression-ok" not in response:
-                                data = sock.recv(4096)
-                                if not data:
-                                    break
-                                response += data
-                            self.assertIn(b"200 OK", response)
-                            self.assertIn(b"ws-origin-regression-ok", response)
-                finally:
-                    origin.shutdown()
-                    origin.server_close()
-                    thread.join(timeout=5)
+            for mode in ("2", "3", "4"):
+                with self.subTest(installer=installer, mode=mode):
+                    self.check_ws_forwarding(installer, mode)
+
+    def check_ws_forwarding(self, installer, mode):
+        config = copy.deepcopy(configuration(installer, mode))
+        server_port, socks_port = free_port(), free_port()
+        config["log"]["loglevel"] = "debug"
+        for inbound in config["inbounds"]:
+            inbound.update(listen="127.0.0.1", port=(
+                server_port if inbound["streamSettings"]["network"] == "ws" else free_port()
+            ))
+        client = {
+            "log": {"loglevel": "debug"},
+            "inbounds": [{
+                "listen": "127.0.0.1", "port": socks_port,
+                "protocol": "socks", "settings": {"auth": "noauth"},
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1", "port": server_port,
+                    "users": [{"id": UUID, "encryption": "none"}],
+                }]},
+                "streamSettings": {
+                    "network": "ws", "security": "none",
+                    "wsSettings": {
+                        "path": WS_PATH, "headers": {"Host": "cdn.example.invalid"},
+                    },
+                },
+            }],
+        }
+        origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TraceHandler)
+        # Newer cores block loopback exits; allow only this temporary test target.
+        config["outbounds"][0].setdefault("settings", {})["finalRules"] = [{
+            "action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"],
+            "port": str(origin.server_port),
+        }]
+        thread = threading.Thread(target=origin.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with running_xray(config, server_port), running_xray(client, socks_port):
+                for inbound in config["inbounds"]:
+                    with socket.create_connection(("127.0.0.1", inbound["port"]), timeout=5):
+                        pass
+                response = socks_get(socks_port, "127.0.0.1", origin.server_port)
+                self.assertIn(b"200 OK", response)
+                self.assertIn(b"ws-origin-regression-ok", response)
+        finally:
+            origin.shutdown()
+            origin.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

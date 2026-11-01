@@ -1,11 +1,15 @@
 # NAT VPS VLESS installer
 
-Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Detect Internet connectivity, choose the server's IPv4/IPv6 outbound policy, then choose one node type. The script starts Xray and prints one private `vless://` client import link:
+Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Detect Internet connectivity, choose the server's IPv4/IPv6 outbound policy, then choose a node type. The script starts Xray and prints one or two private `vless://` client import links:
 
-1. **Direct: VLESS + REALITY + TCP + Vision.** The default REALITY target is Apple's `gateway.icloud.com`.
-2. **CDN-ready VLESS + WebSocket + client TLS.** The script asks for the CDN hostname and generates a directly importable link with that hostname as the address, SNI, and WebSocket Host. The CDN, DNS, proxy status, origin rule, and preferred edge IP remain external.
+1. **Direct only: VLESS + REALITY + TCP + Vision.** The default REALITY target is Apple's `gateway.icloud.com`.
+2. **CDN only: VLESS + WebSocket + client TLS.**
+3. **Direct + CDN:** two separate Xray inbounds and links. Requires two distinct provider port mappings.
+4. **Direct + Cloudflare Tunnel:** direct REALITY plus a loopback-only WebSocket inbound reached through a persistent named Cloudflare Tunnel (sometimes called Argo Tunnel). Requires the Tunnel token and a preconfigured public-hostname route.
 
-Only one inbound is installed, not both. The Alpine variant targets **at least 128 MiB RAM / 1 GiB disk** and avoids Python, additional reverse proxies, panels, and Xray geodata. This is a minimum target, not a guarantee under every workload; 64 MiB is not supported as a deployment target.
+Combined modes share one UUID and outbound policy while keeping separate listeners, transport settings, and links. The Cloudflare Tunnel mode installs and enables `cloudflared` as a separate service. Its additional memory use has not been measured on the script's 128 MiB Alpine test target; do not assume it will fit a 128 MiB VPS.
+
+The Alpine variant targets **at least 128 MiB RAM / 1 GiB disk** for Xray-only modes and avoids Python, panels, and Xray geodata. This is a minimum target, not a guarantee under every workload; 64 MiB is not supported as a deployment target.
 
 It does **not** change your provider's port mapping, firewall, or an existing Xray installation. It refuses to overwrite an existing Xray binary/configuration/service.
 
@@ -34,9 +38,9 @@ Run the Alpine commands as root. The script requires **OpenRC to be booted**, no
 
 The installer first checks IPv4 and IPv6 Internet access using bounded HTTPS requests. It then asks for the outbound policy: **1) IPv4 only**, **2) IPv6 only**, or **3) dual-stack**. Dual-stack is the default when both families work; otherwise the working family is the default. An unavailable family cannot be selected. If neither probe succeeds, the installer stops so you can check routing, DNS, and connectivity.
 
-Next choose node type **1** (direct, default) or **2** (CDN), then enter the origin public IP/hostname, provider-mapped **public TCP port**, corresponding **local TCP listen port**, and custom node name. Mode 1 asks for a REALITY SNI. Mode 2 asks for the CDN hostname and uses client TLS port 443 by default. The public and local ports may differ on a NAT VPS. Keep the printed `vless://` link private: it contains credentials for the node.
+Next select a mode with the **1/2/3/4 installation menu**; press Enter for direct-only, or retry after an invalid choice. No separate post-install control panel is installed. Direct uses one provider-mapped public TCP port and one local listen port. CDN-only uses the origin mapping and CDN hostname. Direct + CDN asks for two distinct provider-mapped ports and two distinct local ports; a single mapped port cannot serve both inbounds. Direct + Cloudflare Tunnel asks for the direct mapping, the Tunnel hostname, a token, and a local WebSocket port. Keep the printed `vless://` links private: they contain credentials for the node.
 
-The provider's external TCP port must map to the local listen port, and its firewall must allow that traffic. For an IPv6 origin endpoint, enter its IPv6 address without square brackets; the generated link will add them.
+The provider's external TCP port must map to the matching local listen port, and its firewall must allow that traffic. For an IPv6 origin endpoint, enter its IPv6 address without square brackets; the generated link will add them.
 
 ## IPv4 and IPv6 egress
 
@@ -46,7 +50,7 @@ The outbound choice controls how **Xray connects to destination websites**. It i
 - **IPv6 only:** resolve and connect using IPv6, and block destination IPv4 literals. IPv4-only destinations will not work; the script does not provide NAT64 or another translation service.
 - **Dual-stack:** allow IPv4 and IPv6 destinations. TCP connections prefer IPv6 and can fall back to IPv4; UDP uses the resolved addresses without the same connection fallback. This does not combine both families into one connection or guarantee that every website uses IPv6.
 
-Detection tests actual HTTPS egress rather than treating an assigned address or a default route as proof of connectivity. It does not discover provider NAT mappings or prove that an incoming public port is reachable. The script does not enable or disable IPv6 system-wide, change kernel settings, or add a tunnel or background network monitor.
+Detection tests actual HTTPS egress rather than treating an assigned address or a default route as proof of connectivity. It does not discover provider NAT mappings or prove that an incoming public port is reachable. Outbound-family selection does not enable or disable IPv6 system-wide, change kernel settings, or add a tunnel or background network monitor. The separate Cloudflare Tunnel service is installed only when mode 4 is selected.
 
 ## CDN mode
 
@@ -67,6 +71,12 @@ Before importing it, configure the CDN hostname externally:
 
 No DNS records, CDN rules, certificates, proxy status, or preferred edge IPs are changed automatically.
 
+## Cloudflare Tunnel mode
+
+Create a **remotely managed named Tunnel** in Cloudflare first. Add a public hostname route in the dashboard to `http://127.0.0.1:<Tunnel WS local port>`; the script does not modify Cloudflare DNS or Tunnel ingress rules. Paste the tunnel token only into the interactive hidden prompt. The script installs `cloudflared` (or reuses an existing binary that supports `--token-file`), stores the token in `/etc/nat-vless/cloudflared.token` with root/service-group-only access, and enables a least-privilege service. It refuses to overwrite its existing Tunnel configuration or service and leaves other Tunnel configuration directories alone. The WebSocket inbound binds only to `127.0.0.1`; it does not need a second public NAT mapping.
+
+The host still needs outbound connectivity to Cloudflare Tunnel endpoints (TCP or UDP port 7844). The connector uses `--edge-ip-version auto` independently of Xray's outbound choice, so it can also run on an IPv6-only host. A running connector service does not prove that the public-hostname route is correct; test the generated link after confirming the dashboard route. Cloudflare Tunnel supports WebSockets. This mode means Cloudflare Tunnel, not Argo Smart Routing.
+
 ## Scope and testing
 
 - Supported targets: Debian/Ubuntu with systemd, or Alpine with working OpenRC; root privileges, an interactive terminal, supported CPU architecture, and outbound access to GitHub and package repositories. Alpine supports x86_64, aarch64, and armv7l.
@@ -74,7 +84,7 @@ No DNS records, CDN rules, certificates, proxy status, or preferred edge IPs are
 - For a 128 MB trial, check `rc-service xray status`, `grep VmRSS /proc/$(pidof xray)/status`, and the container's memory usage after making a real client connection. Leave room for system processes and multiple connections; a successful boot alone is not a stability test.
 - Existing Xray configuration is left untouched; the installer exits before setup in that case.
 - Direct mode was installed on a clean Alpine 3.24.2 x86_64 Podman NAT container with a 128 MiB cgroup limit and 1 GiB disk. The user confirmed client connectivity and service startup after a provider restart. One post-install sample showed 63.3 MiB container memory, 33.1 MiB Xray RSS, 38.1 MiB disk usage, and zero memory-limit/OOM events. These are point-in-time measurements, not long-term or high-concurrency guarantees.
-- The direct-mode measurements do not establish CDN-mode memory usage. Local regression tests cover both configuration/link generators and outbound-family choices, and can validate configurations plus loopback WS forwarding with an Xray binary. They do not install services or validate real DNS/CDN rules. The new outbound-family choices need live testing on a provider host; fresh Debian/Ubuntu deployment remains unverified.
+- The direct-mode measurements do not establish CDN or Cloudflare Tunnel mode memory usage. Local regression tests cover the four-mode menu, configuration/link generators, outbound-family choices, and Alpine link output after removing installer-only dependencies. With an Xray binary they validate all four modes' configurations plus loopback WS forwarding in modes 2, 3, and 4. They do not install services or validate real DNS, CDN, Tunnel tokens, or dashboard routes. The new combined modes and Cloudflare Tunnel service need live testing on a provider host; fresh Debian/Ubuntu deployment remains unverified.
 - Before using on another host, confirm its NAT mapping and firewall rules; avoid using this on a machine with a setup you need to preserve.
 
 ## Regression tests
