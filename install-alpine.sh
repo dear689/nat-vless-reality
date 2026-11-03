@@ -459,6 +459,8 @@ if [ "$node_type" = 4 ]; then
   unset argo_token
 fi
 install -m 640 -o root -g "$service_group" "$tmp_dir/config.json" "$XRAY_CONFIG"
+printf 'nat-vless-reality-v1\n' > /usr/local/etc/xray/.nat-vless-installer
+chmod 600 /usr/local/etc/xray/.nat-vless-installer
 cat > "$XRAY_SERVICE" <<OPENRC
 #!/sbin/openrc-run
 name="Xray"

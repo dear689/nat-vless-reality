@@ -42,6 +42,20 @@ Next select a mode with the **1/2/3/4 installation menu**; press Enter for direc
 
 The provider's external TCP port must map to the matching local listen port, and its firewall must allow that traffic. For an IPv6 origin endpoint, enter its IPv6 address without square brackets; the generated link will add them.
 
+## Startup and uninstall
+
+Startup is automatic: Debian/Ubuntu enables `xray.service`, and Alpine adds `xray` to OpenRC's `default` runlevel. Mode 4 also enables `cloudflared-nat-vless` in the same service manager. No additional startup command is required.
+
+To uninstall on **the target VPS as root**, the same command works on both supported platforms:
+
+```sh
+(nat_uninstall=$(mktemp) && trap 'rm -f "$nat_uninstall"' EXIT && curl -fsSL https://raw.githubusercontent.com/dear689/nat-vless-reality/main/uninstall.sh -o "$nat_uninstall" && sh "$nat_uninstall" --yes)
+```
+
+This immediately stops the project's services, removes their startup entries, and deletes Xray's binary, node configuration, service files, and the local Tunnel token. Omit `--yes` for an interactive confirmation. Legacy installations without the new ownership marker are recognized through the expected service and, on systemd, the node configuration. Additional Xray template instances must be handled before uninstalling their shared binary. Unrecognized installations and redirected file paths are refused before any changes.
+
+Only the known project files are removed; nonempty directories and other files are retained. Generic `cloudflared` binaries/packages, package repositories, system tools and service accounts are retained because the installer may have reused them. The dedicated Tunnel service is removed and will no longer run. Cloudflare-side Tunnel/DNS/CDN configuration and provider NAT mappings must be removed separately if no longer needed. The command can be run again safely and adds no permanent management process.
+
 ## IPv4 and IPv6 egress
 
 The outbound choice controls how **Xray connects to destination websites**. It is independent of the address used to connect to your node. You can keep an IPv4 NAT entry address while selecting IPv6-only or dual-stack egress. Only one origin endpoint and one import link are needed.

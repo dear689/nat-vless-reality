@@ -450,6 +450,8 @@ service_user="$(systemctl show -p User --value xray.service)"
   || fail "Could not determine the Xray systemd service user."
 service_group="$(id -gn "$service_user")"
 install -m 600 -o "$service_user" -g "$service_group" "$tmp_dir/config.json" "$XRAY_CONFIG"
+printf 'nat-vless-reality-v1\n' > /usr/local/etc/xray/.nat-vless-installer
+chmod 600 /usr/local/etc/xray/.nat-vless-installer
 systemctl enable xray.service
 systemctl restart xray.service
 systemctl is-active --quiet xray.service || fail "Xray did not start; inspect: journalctl -u xray -n 50"
