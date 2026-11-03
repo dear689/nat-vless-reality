@@ -5,7 +5,7 @@ Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Detect Int
 1. **Direct only: VLESS + REALITY + TCP + Vision.** The default REALITY target is Apple's `gateway.icloud.com`.
 2. **CDN only: VLESS + WebSocket + client TLS.**
 3. **Direct + CDN:** two separate Xray inbounds and links. Requires two distinct provider port mappings.
-4. **Direct + Cloudflare Tunnel:** direct REALITY plus a loopback-only WebSocket inbound reached through a persistent named Cloudflare Tunnel (sometimes called Argo Tunnel). Requires the Tunnel token and a preconfigured public-hostname route.
+4. **Direct + Cloudflare Tunnel:** direct REALITY plus a loopback-only WebSocket inbound reached through a persistent named Cloudflare Tunnel (sometimes called Argo Tunnel). Requires the Tunnel token and a public-hostname route, which can be added after the connector comes online.
 
 Combined modes share one UUID and outbound policy while keeping separate listeners, transport settings, and links. The Cloudflare Tunnel mode installs and enables `cloudflared` as a separate service. Its additional memory use has not been measured on the script's 128 MiB Alpine test target; do not assume it will fit a 128 MiB VPS.
 
@@ -73,9 +73,17 @@ No DNS records, CDN rules, certificates, proxy status, or preferred edge IPs are
 
 ## Cloudflare Tunnel mode
 
-Create a **remotely managed named Tunnel** in Cloudflare first. Add a public hostname route in the dashboard to `http://127.0.0.1:<Tunnel WS local port>`; the script does not modify Cloudflare DNS or Tunnel ingress rules. Paste the tunnel token only into the interactive hidden prompt. The script installs `cloudflared` (or reuses an existing binary that supports `--token-file`), stores the token in `/etc/nat-vless/cloudflared.token` with root/service-group-only access, and enables a least-privilege service. It refuses to overwrite its existing Tunnel configuration or service and leaves other Tunnel configuration directories alone. The WebSocket inbound binds only to `127.0.0.1`; it does not need a second public NAT mapping.
+Create a **remotely managed named Tunnel** in Cloudflare first. Enter the intended public hostname in the installer and paste the tunnel token only into the interactive hidden prompt. If the dashboard requires an online connector before configuring routes, run the installer first, then add the route. Its service URL must be `http://127.0.0.1:<Tunnel WS local port>` (default `2096`), including `http://`. Leave the route's path field blank; keep the generated random WS path in the client link. The script does not modify Cloudflare DNS or Tunnel ingress rules.
+
+The script installs `cloudflared` (or reuses an existing binary that supports `--token-file`), stores the token in `/etc/nat-vless/cloudflared.token` with root/service-group-only access, and enables a least-privilege service. It refuses to overwrite its existing Tunnel configuration or service and leaves other Tunnel configuration directories alone. The WebSocket inbound binds only to `127.0.0.1`; it does not need a second public NAT mapping.
+
+Both installers print a Chinese dashboard checklist with the exact public hostname, the complete `http://127.0.0.1:<port>` service URL, and the generated client WS path on separate lines for copying. It explains which route field to leave blank and what to enter if the dashboard separates protocol and URL. The Tunnel token is never echoed in this checklist.
+
+TLS terminates at the Cloudflare edge, which must have a valid certificate covering the public hostname. Cloudflare's connection to `cloudflared` is encrypted separately, while `cloudflared` connects to Xray over loopback HTTP. **This local HTTP listener needs no origin certificate.** Unlike ordinary CDN-to-origin forwarding, the zone's Flexible/Full/Full (strict) setting does not change the Tunnel service URL or force this local connection to use HTTPS. Do not treat switching the entire zone to Flexible as a Tunnel prerequisite. See Cloudflare's [HTTPS origin troubleshooting guide](https://developers.cloudflare.com/tunnel/troubleshooting/https-origins/).
 
 The host still needs outbound connectivity to Cloudflare Tunnel endpoints (TCP or UDP port 7844). The connector uses `--edge-ip-version auto` independently of Xray's outbound choice, so it can also run on an IPv6-only host. A running connector service does not prove that the public-hostname route is correct; test the generated link after confirming the dashboard route. Cloudflare Tunnel supports WebSockets. This mode means Cloudflare Tunnel, not Argo Smart Routing.
+
+After service startup, WS modes check the local listener using an HTTP/1.1 WebSocket upgrade. Tunnel mode also checks the public hostname over HTTPS with certificate verification enabled. HTTP `101` confirms the WS handshake, not VLESS authentication or destination Internet access. These bounded checks bypass environment proxies. A failed check reports its HTTP/curl status without deleting services or withholding the links; this also allows the initial installation to finish before you create the dashboard route. The checks run only during installation and add no permanent process or runtime dependency.
 
 ## Scope and testing
 

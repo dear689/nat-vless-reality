@@ -119,6 +119,77 @@ select_node_type() {
   done
 }
 
+probe_websocket() {
+  ws_probe_exit=0
+  ws_probe_status=$(curl --disable --noproxy '*' --proto '=http,https' --http1.1 \
+    --connect-timeout 2 --max-time 3 --silent --output /dev/null \
+    --write-out '%{http_code}' \
+    --header "Host: $2" --header 'Connection: Upgrade' --header 'Upgrade: websocket' \
+    --header 'Sec-WebSocket-Version: 13' \
+    --header 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$1" 2>/dev/null) \
+    || ws_probe_exit=$?
+  # An upgraded connection may time out; HTTP 101 still confirms the handshake.
+  ws_probe_status=${ws_probe_status:-000}
+}
+
+print_tunnel_setup() {
+  printf '\n========== Cloudflare Tunnel 填写清单 ==========\n'
+  printf '1. 进入 Cloudflare 控制台 -> 网络（Networking）-> Tunnels -> 刚创建的隧道。\n'
+  printf '   选择 路由（Routes）-> 添加路由 -> 已发布应用程序（Published application）。\n'
+  printf '2. 主机名：选择你的域名并填写子域名，最终完整主机名必须是：\n'
+  printf '%s\n' "$cdn_domain"
+  printf '3. 路径（Path）：留空，不要把客户端的 WS 路径填在这里。\n'
+  printf '4. 服务地址（Service URL）：使用 HTTP，完整地址整行复制：\n'
+  printf 'http://127.0.0.1:%s\n' "$ws_listen_port"
+  printf '   如果界面分成“类型”和“URL”两栏：类型选 HTTP，URL 只填下面这一行：\n'
+  printf '127.0.0.1:%s\n' "$ws_listen_port"
+  printf '5. 保存路由。DNS 应自动生成指向该隧道的 CNAME，不用添加指向 VPS 的 A 记录。\n'
+  printf '6. 将上方 -Tunnel 节点导入客户端；以下参数已在链接中填好：\n'
+  printf '   端口：443；传输：WebSocket；TLS：开启。\n'
+  printf '   地址、SNI 和 Host：\n%s\n' "$cdn_domain"
+  printf '   仅用于客户端的 WS 路径：\n%s\n' "$ws_path"
+  printf '证书：客户端使用 Cloudflare 边缘证书；Tunnel 已加密，本机 HTTP 不需要源站证书。\n'
+  printf '本机回源协议由上面的 http:// 地址决定，无须为 Tunnel 强制将整个域名改为灵活模式。\n'
+  printf '服务器需允许出站 TCP 或 UDP 7844；不需要为 WS 开公网入站端口。\n'
+  printf 'Token 已保存在 root/服务组可读文件中，不会在此清单或节点链接中回显。\n'
+  printf '================================================\n'
+}
+
+check_websocket_setup() {
+  [ "$node_type" != 1 ] || return 0
+  ws_probe_address=127.0.0.1
+  if [ "$node_type" != 4 ] && [ "$listen_address" = '::' ]; then
+    ws_probe_address='[::1]'
+  fi
+  printf '正在检查本机 WebSocket 握手...\n'
+  for ws_probe_attempt in 1 2 3; do
+    probe_websocket "http://$ws_probe_address:$ws_listen_port$ws_path" "$cdn_domain"
+    [ "$ws_probe_status" = 101 ] && break
+    if [ "$ws_probe_attempt" != 3 ]; then sleep 1; fi
+  done
+  if [ "$ws_probe_status" = 101 ]; then
+    printf '本机 WebSocket 握手通过（HTTP 101）。\n'
+  else
+    printf '警告：本机 WS 检查未通过（HTTP %s，curl 状态 %s），请检查 Xray 服务、监听端口和路径。\n' \
+      "$ws_probe_status" "$ws_probe_exit"
+  fi
+  [ "$node_type" = 4 ] || return 0
+  printf '正在检查 Tunnel 域名的 TLS 和 WebSocket 回源...\n'
+  probe_websocket "https://$cdn_domain$ws_path" "$cdn_domain"
+  if [ "$ws_probe_status" = 101 ]; then
+    printf 'Tunnel 公网 TLS 和 WS 握手通过（HTTP 101）；VLESS 认证和上网仍需客户端实测。\n'
+  else
+    printf '提示：Tunnel 公网 WS 尚未通过（HTTP %s，curl 状态 %s），节点链接仍会输出。\n' \
+      "$ws_probe_status" "$ws_probe_exit"
+    case "$ws_probe_exit" in
+      6) printf '域名暂时无法解析，请检查公开主机名的 Tunnel CNAME 记录。\n' ;;
+      35|51|60) printf '公网 TLS 握手或证书校验失败，请检查该域名的 Cloudflare 边缘证书。\n' ;;
+      *) printf '请确认 Tunnel 已连接，并将公开路由设为 http://127.0.0.1:%s；尚未配置的可在连接器上线后添加。\n' "$ws_listen_port" ;;
+    esac
+    printf '进程启动不代表隧道和公开路由已经可用；不必因此重复安装。\n'
+  fi
+}
+
 [ "$(id -u)" -eq 0 ] || fail 'Run as root.'
 [ -f /etc/alpine-release ] || fail 'This installer supports Alpine Linux only.'
 command -v apk >/dev/null 2>&1 || fail 'apk is required.'
@@ -177,7 +248,7 @@ if [ "$node_type" = 2 ] || [ "$node_type" = 3 ]; then
 fi
 if [ "$node_type" = 4 ]; then
   printf '提示：Argo 隧道会额外运行 cloudflared，128 MB 机器尚未验证内存余量。\n'
-  printf 'Tunnel 域名（Cloudflare Tunnel 中已配置的公开主机名）：' >/dev/tty
+  printf 'Tunnel 域名（公开主机名，可在连接器上线后添加路由）：' >/dev/tty
   IFS= read -r cdn_domain <&3 || fail 'Could not read Tunnel hostname.'
   printf '粘贴 Cloudflare Tunnel Token（输入不回显）：' >/dev/tty
   IFS= read -r -s argo_token <&3 || fail 'Could not read Cloudflare Tunnel token.'
@@ -424,6 +495,8 @@ OPENRC
     || fail 'Cloudflare Tunnel did not start; inspect rc-service cloudflared-nat-vless status.'
 fi
 
+check_websocket_setup
+
 case "$public_host" in
   *:*) case "$public_host" in \[*\]) ;; *) public_host="[$public_host]" ;; esac ;;
 esac
@@ -474,14 +547,12 @@ if [ "$node_type" = 2 ] || [ "$node_type" = 3 ]; then
   printf '请在外部开启该域名的 CDN 代理和 WebSocket。\n'
   printf '本脚本不会修改 DNS、代理状态、回源规则或优选 IP。\n'
   printf '如果之后使用优选 CDN IP，只替换链接中的地址，SNI 和 WebSocket Host 保持不变。\n'
-  printf 'CDN 到源站仍是明文 HTTP WebSocket；本脚本没有配置源站证书或 Full（严格）模式。\n'
+  printf '普通 CDN 回源是 HTTP，未配置源站证书；Cloudflare 需为该主机名设置灵活（Flexible）模式。\n'
+  printf '其他网站需要完全/严格模式时，请用仅匹配此主机名的配置规则，避免改动整个域名。\n'
   printf '警告：CDN 到源站的链路是明文，随机路径不是加密或防火墙。\n'
 fi
 if [ "$node_type" = 4 ]; then
-  printf 'Cloudflare Tunnel 公开主机名 %s 应路由到 http://127.0.0.1:%s。\n' \
-    "$cdn_domain" "$ws_listen_port"
-  printf 'Tunnel 需要服务器允许出站访问 TCP 或 UDP 7844；不需要为 WS 开公网入站端口。\n'
-  printf 'Token 已保存到 root/服务组可读文件，不会打印到链接或服务命令行中。\n'
+  print_tunnel_setup
 fi
 if [ "$node_type" != 2 ]; then
   printf '\n直连映射：公网 TCP %s -> 本机 TCP %s。\n' "$direct_public_port" "$direct_listen_port"

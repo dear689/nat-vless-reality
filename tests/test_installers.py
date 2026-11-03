@@ -118,7 +118,7 @@ def links(installer, mode, host, address_family="3"):
         end = ALPINE.index("# Clean both the release archive", start)
         output_start = ALPINE.index("printf '\\nXray 服务已启动。")
         output = shell_run(
-            ALPINE[start:end]
+            shell_function(ALPINE, "print_tunnel_setup") + "\n" + ALPINE[start:end]
             + '\njq() { printf "jq was called after dependency cleanup\\n" >&2; return 127; }\n'
             + ALPINE[output_start:],
             {
@@ -315,6 +315,90 @@ class ModeSelectionTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(len(links("alpine", mode, "198.51.100.20")),
                                  2 if mode in ("3", "4") else 1)
+
+
+class WebSocketCheckTests(unittest.TestCase):
+    def test_dashboard_checklist_uses_the_selected_port_and_separate_client_path(self):
+        for installer, source in (("alpine", ALPINE), ("debian", DEBIAN)):
+            with self.subTest(installer=installer):
+                output = shell_run(
+                    shell_function(source, "print_tunnel_setup") + "\nprint_tunnel_setup\n",
+                    {
+                        "cdn_domain": "argo.example.com",
+                        "ws_listen_port": "31099",
+                        "ws_path": WS_PATH,
+                        "argo_token": "test-token-that-must-not-be-printed",
+                    },
+                )
+                lines = output.splitlines()
+                self.assertIn("argo.example.com", lines)
+                self.assertIn("http://127.0.0.1:31099", lines)
+                self.assertIn("127.0.0.1:31099", lines)
+                self.assertIn(WS_PATH, lines)
+                self.assertNotIn("2096", output)
+                self.assertIn("路径（Path）：留空", output)
+                self.assertNotIn("test-token-that-must-not-be-printed", output)
+
+    def test_upgrade_timeout_still_counts_as_a_handshake(self):
+        for installer, source in (("alpine", ALPINE), ("debian", DEBIAN)):
+            with self.subTest(installer=installer):
+                output = shell_run(
+                    "set -e\ncurl() { printf 101; return 28; }\n"
+                    + shell_function(source, "probe_websocket")
+                    + '\nprobe_websocket http://127.0.0.1:2096/ws test.invalid\n'
+                      'printf "RESULT %s %s\\n" "$ws_probe_status" "$ws_probe_exit"\n',
+                    {},
+                )
+                self.assertIn("RESULT 101 28", output)
+
+    def test_missing_public_route_is_nonfatal_and_not_reported_as_success(self):
+        for installer, source in (("alpine", ALPINE), ("debian", DEBIAN)):
+            for status, exit_code in (("000", "6"), ("000", "60"), ("502", "0")):
+                with self.subTest(installer=installer, status=status, exit_code=exit_code):
+                    output = shell_run(
+                        "set -e\n"
+                        + shell_function(source, "check_websocket_setup")
+                        + r'''
+probe_websocket() {
+  case "$1" in
+    http://*) ws_probe_status=101; ws_probe_exit=28 ;;
+    https://*) ws_probe_status=$TEST_STATUS; ws_probe_exit=$TEST_EXIT ;;
+  esac
+}
+check_websocket_setup
+printf 'RESULT finished\n'
+''',
+                        {**variables("4"), "TEST_STATUS": status, "TEST_EXIT": exit_code},
+                    )
+                    self.assertIn("RESULT finished", output)
+                    self.assertIn(f"HTTP {status}", output)
+                    self.assertNotIn("Tunnel 公网 TLS 和 WS 握手通过", output)
+
+    def test_origin_address_and_direct_only_skip(self):
+        for installer, source in (("alpine", ALPINE), ("debian", DEBIAN)):
+            for mode in ("1", "2", "3", "4"):
+                with self.subTest(installer=installer, mode=mode):
+                    output = shell_run(
+                        "set -e\n"
+                        + shell_function(source, "check_websocket_setup")
+                        + r'''
+probe_websocket() {
+  printf 'PROBE %s\n' "$1"
+  ws_probe_status=101
+  ws_probe_exit=0
+}
+check_websocket_setup
+''',
+                        variables(mode, host="2001:db8::20"),
+                    )
+                    probes = [line for line in output.splitlines() if line.startswith("PROBE ")]
+                    if mode == "1":
+                        self.assertEqual(probes, [])
+                    else:
+                        address = "127.0.0.1" if mode == "4" else "[::1]"
+                        self.assertEqual(probes[0], f"PROBE http://{address}:"
+                                         + variables(mode)["ws_listen_port"] + WS_PATH)
+                        self.assertEqual(len(probes), 2 if mode == "4" else 1)
 
 
 class GeneratorTests(unittest.TestCase):
@@ -710,6 +794,27 @@ class XrayTests(unittest.TestCase):
         thread.start()
         try:
             with running_xray(config, server_port), running_xray(client, socks_port):
+                source = ALPINE if installer == "alpine" else DEBIAN
+                probe = shell_function(source, "probe_websocket")
+                output = shell_run(
+                    "set -e\n" + probe
+                    + '\nprobe_websocket "$TEST_URL" cdn.example.invalid\n'
+                      'printf "RESULT %s\\n" "$ws_probe_status"\n',
+                    {
+                        "TEST_URL": f"http://127.0.0.1:{server_port}{WS_PATH}",
+                        "HTTP_PROXY": "http://127.0.0.1:9",
+                        "ALL_PROXY": "socks5://127.0.0.1:9",
+                    },
+                )
+                self.assertIn("RESULT 101", output)
+                if mode == "4":
+                    output = shell_run(
+                        "set -e\n" + probe
+                        + '\nprobe_websocket "$TEST_URL" cdn.example.invalid\n'
+                          'printf "RESULT %s\\n" "$ws_probe_status"\n',
+                        {"TEST_URL": f"http://127.0.0.1:{server_port}/wrong-path"},
+                    )
+                    self.assertIn("RESULT 404", output)
                 for inbound in config["inbounds"]:
                     with socket.create_connection(("127.0.0.1", inbound["port"]), timeout=5):
                         pass
