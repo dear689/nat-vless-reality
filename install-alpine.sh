@@ -510,7 +510,7 @@ jq -n \
   | if $routing_mode == "2" then
       .inbounds |= map(. + {
         sniffing: {
-          enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true
+          enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: false
         }
       })
       | .outbounds += [{

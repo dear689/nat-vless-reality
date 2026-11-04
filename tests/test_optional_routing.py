@@ -19,6 +19,9 @@ import test_installers as installers
 SUFFIX_DOMAIN = "route.test.invalid"
 EXACT_DOMAIN = "exact.test.invalid"
 DIRECT_DOMAIN = "ordinary.test.invalid"
+PROXIED_DOMAINS = (
+    SUFFIX_DOMAIN, "child." + SUFFIX_DOMAIN, EXACT_DOMAIN,
+)
 DOMAINS = "domain:" + SUFFIX_DOMAIN + "\nfull:" + EXACT_DOMAIN
 SOCKS_USER = "route-user"
 SOCKS_PASSWORD = 'synthetic-"password\\only'
@@ -149,7 +152,7 @@ class OptionalRoutingGeneratorTests(unittest.TestCase):
                     for inbound in config["inbounds"]:
                         sniffing = inbound["sniffing"]
                         self.assertTrue(sniffing["enabled"])
-                        self.assertTrue(sniffing["routeOnly"])
+                        self.assertFalse(sniffing["routeOnly"])
                         self.assertIn("http", sniffing["destOverride"])
                         self.assertIn("tls", sniffing["destOverride"])
 
@@ -464,11 +467,15 @@ class AuthenticatedSocksHandler(socketserver.BaseRequestHandler):
                 return
             port, = struct.unpack("!H", installers.receive_exact(client, 2))
             self.server.requests.append((target, port, username))
-            if version != 5 or command != 1 or port != self.server.origin_port:
+            origin_address = self.server.origin_addresses.get(target)
+            if (
+                version != 5 or command != 1
+                or port != self.server.origin_port or origin_address is None
+            ):
                 client.sendall(b"\x05\x02\x00\x01" + b"\x00" * 6)
                 return
             with socket.create_connection(
-                ("127.0.0.1", port), timeout=5
+                (origin_address, port), timeout=5
             ) as origin:
                 client.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
                 while True:
@@ -492,6 +499,9 @@ class AuthenticatedSocksServer(socketserver.ThreadingTCPServer):
     def __init__(self, origin_port):
         super().__init__(("127.0.0.1", 0), AuthenticatedSocksHandler)
         self.origin_port = origin_port
+        self.origin_addresses = {
+            target: "127.0.0.1" for target in PROXIED_DOMAINS
+        }
         self.requests = []
         self.stopped = False
         self.thread = threading.Thread(
@@ -618,7 +628,7 @@ class OptionalRoutingXrayTests(unittest.TestCase):
                     "ip": ["::1/128"], "port": str(origin_port),
                 })
                 targets = [
-                    SUFFIX_DOMAIN, "child." + SUFFIX_DOMAIN, EXACT_DOMAIN,
+                    *PROXIED_DOMAINS,
                     "child." + EXACT_DOMAIN, DIRECT_DOMAIN,
                 ]
                 config["dns"] = {
@@ -663,17 +673,23 @@ class OptionalRoutingXrayTests(unittest.TestCase):
                             )
                             self.assertIn(DIRECT_BODY, response)
                             self.assertNotIn(PROXY_BODY, response)
-                    sniffed = request_http(
-                        socks_port, "::1", origin_port,
-                        host_header=SUFFIX_DOMAIN,
-                    )
-                    self.assertIn(
-                        PROXY_BODY, sniffed,
-                        "An IP target with a matching HTTP Host must be routed",
-                    )
+                    wrong_addresses = ("192.0.2.123", "2001:db8::123")
+                    for address in wrong_addresses:
+                        with self.subTest(target=address, route="sniffed-domain"):
+                            sniffed = request_http(
+                                socks_port, address, origin_port,
+                                host_header=SUFFIX_DOMAIN,
+                            )
+                            self.assertIn(
+                                PROXY_BODY, sniffed,
+                                "The matching HTTP Host must replace a wrong IP",
+                            )
+                            self.assertNotIn(DIRECT_BODY, sniffed)
                     self.assertEqual(
                         [request[0] for request in upstream.requests],
-                        [*targets[:3], "::1"],
+                        [*PROXIED_DOMAINS, *(
+                            SUFFIX_DOMAIN for _ in wrong_addresses
+                        )],
                     )
                     self.assertTrue(all(
                         request[2] == SOCKS_USER

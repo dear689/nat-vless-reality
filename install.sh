@@ -529,7 +529,7 @@ if os.environ.get("XRAY_ROUTING_MODE", "1") == "2":
     for inbound in inbounds:
         inbound["sniffing"] = {
             "enabled": True, "destOverride": ["http", "tls", "quic"],
-            "routeOnly": True,
+            "routeOnly": False,
         }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
