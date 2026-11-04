@@ -1,6 +1,6 @@
 # NAT VPS VLESS installer
 
-Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Detect Internet connectivity, choose the server's IPv4/IPv6 outbound policy, then choose a node type. The script starts Xray and prints one or two private `vless://` client import links:
+Interactive installers for a **new Debian/Ubuntu or Alpine NAT VPS**. Detect Internet connectivity, choose the server's IPv4/IPv6 outbound policy, then choose a node type and optional domain routing. The script starts Xray and prints one or two private `vless://` client import links:
 
 1. **Direct only: VLESS + REALITY + TCP + Vision.** The default REALITY target is Apple's `gateway.icloud.com`.
 2. **CDN only: VLESS + WebSocket + client TLS.**
@@ -40,6 +40,8 @@ The installer first checks IPv4 and IPv6 Internet access using bounded HTTPS req
 
 Next select a mode with the **1/2/3/4 installation menu**; press Enter for direct-only, or retry after an invalid choice. No separate post-install control panel is installed. Direct uses one provider-mapped public TCP port and one local listen port. CDN-only uses the origin mapping and CDN hostname. Direct + CDN asks for two distinct provider-mapped ports and two distinct local ports; a single mapped port cannot serve both inbounds. Direct + Cloudflare Tunnel asks for the direct mapping, the Tunnel hostname, a token, and a local WebSocket port. Keep the printed `vless://` links private: they contain credentials for the node.
 
+The separate Chinese routing menu defaults to **1) ordinary mode**. Choose **2) custom domains via SOCKS5** to enter your own domains and upstream address, port, and optional credentials. Both choices work with every node type; no domain list is bundled or downloaded.
+
 The provider's external TCP port must map to the matching local listen port, and its firewall must allow that traffic. For an IPv6 origin endpoint, enter its IPv6 address without square brackets; the generated link will add them.
 
 ## Startup and uninstall
@@ -58,13 +60,33 @@ Only the known project files are removed; nonempty directories and other files a
 
 ## IPv4 and IPv6 egress
 
-The outbound choice controls how **Xray connects to destination websites**. It is independent of the address used to connect to your node. You can keep an IPv4 NAT entry address while selecting IPv6-only or dual-stack egress. Only one origin endpoint and one import link are needed.
+The outbound choice controls how **Xray connects directly to destination websites**. It is independent of the address used to connect to your node. You can keep an IPv4 NAT entry address while selecting IPv6-only or dual-stack egress. Optional domain routing sends only matching traffic through a separate SOCKS5 outbound; the ordinary policy below continues to apply to other destinations.
 
 - **IPv4 only:** resolve and connect using IPv4, and block destination IPv6 literals.
 - **IPv6 only:** resolve and connect using IPv6, and block destination IPv4 literals. IPv4-only destinations will not work; the script does not provide NAT64 or another translation service.
 - **Dual-stack:** allow IPv4 and IPv6 destinations. TCP connections prefer IPv6 and can fall back to IPv4; UDP uses the resolved addresses without the same connection fallback. This does not combine both families into one connection or guarantee that every website uses IPv6.
 
 Detection tests actual HTTPS egress rather than treating an assigned address or a default route as proof of connectivity. It does not discover provider NAT mappings or prove that an incoming public port is reachable. Outbound-family selection does not enable or disable IPv6 system-wide, change kernel settings, or add a tunnel or background network monitor. The separate Cloudflare Tunnel service is installed only when mode 4 is selected.
+
+## Optional domain routing
+
+Choose **2** in the routing menu to send selected domains through a SOCKS5 server you already operate on another host. Enter its IP or hostname, port (default `1080`), username, and password. Leave the username empty for an upstream that does not require authentication; otherwise both credentials must be between 1 and 255 UTF-8 bytes. The password prompt is hidden. This version accepts SOCKS5 connection details, not VLESS/VMess/Shadowsocks import links, and does not install a SOCKS5 server on the other host.
+
+Enter domains separated by spaces or English commas:
+
+```text
+example.com full:exact.example.net domain:another.example.org
+```
+
+Bare `example.com` is normalized to `domain:example.com` and matches that domain and its subdomains. `full:exact.example.net` matches only the exact hostname. Rules are lowercased and deduplicated. URLs, paths, ports, wildcard syntax, and IP addresses are rejected; use ASCII/Punycode hostnames. An enabled list cannot be empty. All domains are supplied by you; the installer has no preset AI/service rules.
+
+The existing `direct` outbound stays first. Unmatched traffic uses the selected IPv4/IPv6 policy, and matched traffic uses `custom-upstream` through SOCKS5. Both inbounds in a combined mode share these rules. A failed upstream connection fails the matching request instead of falling back to ordinary egress. TCP and UDP matches use the same outbound, but UDP needs a SOCKS5 server with working UDP ASSOCIATE support and reachable relay ports.
+
+The upstream address must be reachable from the NAT host. Its connection is independent of the ordinary outbound policy: choosing IPv6-only ordinary egress can still use an IPv4 SOCKS5 endpoint when the operating system has working IPv4. A genuinely IPv6-only host needs a reachable IPv6 upstream. SOCKS5 itself, including its authentication, is unencrypted on the network; destination HTTPS content retains its own TLS encryption.
+
+Domain routing enables HTTP/TLS/QUIC sniffing with `routeOnly` on the VLESS inbounds so that recognizable hostnames can select a route even when a client passes an IP. This does not replace the original destination and cannot guarantee a match for ECH or traffic without a usable hostname. It also does not guarantee that a service will accept the upstream IP.
+
+Ordinary mode leaves sniffing and routing absent from the generated configuration. Enabling routing adds only Xray configuration: no extra resident process, geodata download, or Alpine Python dependency. Credentials are written into the protected Xray configuration, passed to its generator through the environment instead of command arguments, and not included in the printed links or routing summary. Startup and uninstall use the existing service and commands.
 
 ## CDN mode
 
@@ -106,7 +128,7 @@ After service startup, WS modes check the local listener using an HTTP/1.1 WebSo
 - For a 128 MB trial, check `rc-service xray status`, `grep VmRSS /proc/$(pidof xray)/status`, and the container's memory usage after making a real client connection. Leave room for system processes and multiple connections; a successful boot alone is not a stability test.
 - Existing Xray configuration is left untouched; the installer exits before setup in that case.
 - Direct mode was installed on a clean Alpine 3.24.2 x86_64 Podman NAT container with a 128 MiB cgroup limit and 1 GiB disk. The user confirmed client connectivity and service startup after a provider restart. One post-install sample showed 63.3 MiB container memory, 33.1 MiB Xray RSS, 38.1 MiB disk usage, and zero memory-limit/OOM events. These are point-in-time measurements, not long-term or high-concurrency guarantees.
-- The direct-mode measurements do not establish CDN or Cloudflare Tunnel mode memory usage. Local regression tests cover the four-mode menu, configuration/link generators, outbound-family choices, and Alpine link output after removing installer-only dependencies. With an Xray binary they validate all four modes' configurations plus loopback WS forwarding in modes 2, 3, and 4. They do not install services or validate real DNS, CDN, Tunnel tokens, or dashboard routes. The new combined modes and Cloudflare Tunnel service need live testing on a provider host; fresh Debian/Ubuntu deployment remains unverified.
+- The direct-mode measurements do not establish CDN, Cloudflare Tunnel, or optional domain-routing memory usage. Local regression tests cover the four-mode menu, configuration/link generators, outbound-family choices, optional routing input, and Alpine link output after removing installer-only dependencies. With an Xray binary they validate all four modes' configurations plus loopback WS forwarding in modes 2, 3, and 4. Optional routing tests run a real VLESS/WS client-server chain with an authenticated SOCKS5 fixture and separate IPv4/IPv6 origins, checking suffix/exact domain rules, sniffed HTTP Host routing, unaffected ordinary traffic, and upstream failure without direct fallback. They do not install services or validate real DNS, CDN, Tunnel tokens, dashboard routes, UDP relaying, or provider-to-provider routing. The new combined modes, Cloudflare Tunnel service, and optional routing need live testing on a provider host; fresh Debian/Ubuntu deployment remains unverified.
 - Before using on another host, confirm its NAT mapping and firewall rules; avoid using this on a machine with a setup you need to preserve.
 
 ## Regression tests
@@ -117,4 +139,4 @@ Requires Python 3, a POSIX shell, and `jq`. Uses synthetic credentials and local
 python3 -m unittest discover -s tests -v
 ```
 
-Set `XRAY_TEST_BIN` to an Xray executable to also run configuration validation and loopback WS forwarding. `INSTALLER_TEST_SHELL` and `JQ_TEST_BIN` can specify the shell and jq executable explicitly. No production configuration or credentials are loaded.
+Set `XRAY_TEST_BIN` to an Xray executable to also run configuration validation, loopback WS forwarding, and the optional SOCKS5 routing chain. `INSTALLER_TEST_SHELL` and `JQ_TEST_BIN` can specify the shell and jq executable explicitly. No production configuration or credentials are loaded.

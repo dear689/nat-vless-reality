@@ -119,6 +119,107 @@ select_node_type() {
   done
 }
 
+validate_route_domain() {
+  route_validation_domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$route_validation_domain" in
+    domain:*) route_validation_domain=${route_validation_domain#domain:} ;;
+    full:*) route_validation_domain=${route_validation_domain#full:} ;;
+  esac
+  validate_hostname "$route_validation_domain" "$2"
+  case "$route_validation_domain" in
+    *[!0-9.]*) ;;
+    *) fail "$2 需要填写域名，不能填写 IP 地址。" ;;
+  esac
+  route_domain_old_ifs=$IFS
+  IFS=.
+  set -- $route_validation_domain
+  IFS=$route_domain_old_ifs
+  for route_domain_label do
+    [ "${#route_domain_label}" -le 63 ] \
+      || fail '分流域名的每一段不能超过 63 个字符。'
+  done
+}
+
+normalize_route_domains() {
+  route_domain_input=$(printf '%s' "$route_domains" \
+    | tr '[:upper:]' '[:lower:]' | tr ',[:space:]' '\n')
+  route_domains=
+  while IFS= read -r route_rule || [ -n "$route_rule" ]; do
+    [ -n "$route_rule" ] || continue
+    case "$route_rule" in
+      domain:*) route_prefix=domain:; route_domain=${route_rule#domain:} ;;
+      full:*) route_prefix=full:; route_domain=${route_rule#full:} ;;
+      *) route_prefix=domain:; route_domain=$route_rule ;;
+    esac
+    validate_route_domain "$route_domain" '分流域名'
+    route_rule=$route_prefix$route_domain
+    if ! printf '%s\n' "$route_domains" | grep -Fxq "$route_rule"; then
+      if [ -n "$route_domains" ]; then
+        route_domains="$route_domains
+$route_rule"
+      else
+        route_domains=$route_rule
+      fi
+    fi
+  done <<ROUTE_DOMAINS
+$route_domain_input
+ROUTE_DOMAINS
+  [ -n "$route_domains" ] || fail '启用分流时至少填写一个域名。'
+}
+
+validate_route_auth() {
+  if [ -z "$route_user" ]; then
+    [ -z "$route_password" ] || fail 'SOCKS5 密码不能在用户名为空时单独填写。'
+    return 0
+  fi
+  route_user_bytes=$(printf '%s' "$route_user" | wc -c)
+  route_password_bytes=$(printf '%s' "$route_password" | wc -c)
+  [ "$route_user_bytes" -le 255 ] \
+    && [ "$route_password_bytes" -ge 1 ] && [ "$route_password_bytes" -le 255 ] \
+    || fail 'SOCKS5 用户名和密码各需 1 到 255 个 UTF-8 字节。'
+}
+
+select_routing_mode() {
+  routing_mode=1
+  route_domains=
+  route_host=
+  route_port=
+  route_user=
+  route_password=
+  while :; do
+    printf '流量分流：\n  1) 普通模式（全部使用本机出站）\n  2) 自定义域名分流（指定域名走 SOCKS5 上游）\n请选择 [1]：' >/dev/tty
+    IFS= read -r routing_mode <&3 || fail '无法读取分流模式。'
+    routing_mode=${routing_mode:-1}
+    case "$routing_mode" in
+      1) return 0 ;;
+      2) break ;;
+      *) printf '请输入 1 或 2。\n' ;;
+    esac
+  done
+  set +x
+  printf '需要分流的域名（空格或逗号分隔，裸域名包含子域，full: 表示精确匹配）：' >/dev/tty
+  IFS= read -r route_domains <&3 || fail '无法读取分流域名。'
+  normalize_route_domains
+  printf 'SOCKS5 上游 IP 或域名（不带协议和端口）：' >/dev/tty
+  IFS= read -r route_host <&3 || fail '无法读取 SOCKS5 上游地址。'
+  case "$route_host" in
+    \[*\]) route_host=${route_host#\[}; route_host=${route_host%\]} ;;
+  esac
+  validate_host "$route_host" 'SOCKS5 上游地址'
+  printf 'SOCKS5 上游端口 [1080]：' >/dev/tty
+  IFS= read -r route_port <&3 || fail '无法读取 SOCKS5 上游端口。'
+  route_port=${route_port:-1080}
+  validate_port "$route_port" 'SOCKS5 上游端口'
+  printf 'SOCKS5 用户名（无需认证则留空）：' >/dev/tty
+  IFS= read -r route_user <&3 || fail '无法读取 SOCKS5 用户名。'
+  if [ -n "$route_user" ]; then
+    printf 'SOCKS5 密码（输入不回显）：' >/dev/tty
+    IFS= read -r -s route_password <&3 || fail '无法读取 SOCKS5 密码。'
+    printf '\n' >/dev/tty
+  fi
+  validate_route_auth
+}
+
 probe_websocket() {
   ws_probe_exit=0
   ws_probe_status=$(curl --disable --noproxy '*' --proto '=http,https' --http1.1 \
@@ -210,6 +311,7 @@ printf '正在检测 IPv4 和 IPv6 的外网 HTTPS 连通性（最长约 20 秒�
 detect_address_families
 select_address_family
 select_node_type
+select_routing_mode
 printf '公网 IP 或域名（客户端/CDN 入口，与出站方式无关）：' >/dev/tty
 IFS= read -r public_host <&3 || fail 'Could not read public host.'
 direct_public_port=
@@ -351,10 +453,14 @@ if [ "$node_type" != 1 ]; then
   ws_path="/ws-$random_id"
 fi
 
+export XRAY_ROUTE_USER="$route_user"
+export XRAY_ROUTE_PASSWORD="$route_password"
 jq -n \
   --arg mode "$node_type" --arg family "$address_family" --arg path "$ws_path" \
   --arg address "$listen_address" --arg direct_port "$direct_listen_port" \
   --arg ws_port "$ws_listen_port" \
+  --arg routing_mode "${routing_mode:-1}" --arg route_domains "${route_domains:-}" \
+  --arg route_host "${route_host:-}" --arg route_port "${route_port:-}" \
   --arg uuid "$uuid" --arg sni "$server_name" \
   --arg private_key "$private_key" --arg sid "$short_id" '
   {
@@ -400,7 +506,33 @@ jq -n \
         }
       } else {} end))}
     }]
-  }' > "$tmp_dir/config.json"
+    }
+  | if $routing_mode == "2" then
+      .inbounds |= map(. + {
+        sniffing: {
+          enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true
+        }
+      })
+      | .outbounds += [{
+          protocol: "socks", tag: "custom-upstream",
+          settings: {
+            servers: [{
+              address: $route_host, port: ($route_port | tonumber)
+            } + (if (env.XRAY_ROUTE_USER // "") != "" then {
+              users: [{user: env.XRAY_ROUTE_USER, pass: env.XRAY_ROUTE_PASSWORD}]
+            } else {} end)]
+          }
+        }]
+      | .routing = {
+          domainStrategy: "AsIs",
+          rules: [{
+            type: "field",
+            domain: ($route_domains | split("\n") | map(select(length > 0))),
+            outboundTag: "custom-upstream"
+          }]
+        }
+    else . end' > "$tmp_dir/config.json"
+unset XRAY_ROUTE_USER XRAY_ROUTE_PASSWORD route_user route_password
 "$tmp_dir/xray" run -test -config "$tmp_dir/config.json"
 id nobody >/dev/null 2>&1 || fail 'The nobody service user is missing.'
 service_group=$(id -gn nobody)
@@ -530,6 +662,16 @@ case "$address_family" in
   2) printf '节点出站方式：仅 IPv6\n' ;;
   3) printf '节点出站方式：双栈（TCP 优先 IPv6，IPv4 回退）\n' ;;
 esac
+if [ "${routing_mode:-1}" = 2 ]; then
+  printf '自定义域名分流：已启用；命中域名走 SOCKS5 上游，其余流量走本机。\n'
+  printf '命中域名的上游连接失败时，不会回落到本机出口。\n'
+  printf '分流域名规则：\n%s\n' "$route_domains"
+  printf '分流上游：%s:%s（账号密码不回显）。\n' "$route_host" "$route_port"
+  printf '本机 IPv4/IPv6 出站选择只约束普通流量；上游连接使用系统可达的地址族。\n'
+  printf 'SOCKS5 链路和认证不加密；HTTPS 内容仍使用 TLS。UDP/QUIC 需要上游支持 UDP。\n'
+else
+  printf '流量分流：普通模式，全部使用本机出站。\n'
+fi
 if [ "$direct_enabled" -eq 1 ]; then
   printf '\n直连 VLESS 链接：\n'
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \

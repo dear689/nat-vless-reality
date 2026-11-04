@@ -48,6 +48,93 @@ validate_port() {
     || fail "$label must be between 1 and 65535."
 }
 
+validate_route_domain() {
+  local value="${1,,}"
+  local label="$2"
+  local part
+  local -a route_labels
+  case "$value" in
+    domain:*) value="${value#domain:}" ;;
+    full:*) value="${value#full:}" ;;
+  esac
+  validate_hostname "$value" "$label"
+  [[ ! "$value" =~ ^[0-9.]+$ ]] || fail "$label 只能填写域名，不能填写 IP。"
+  IFS=. read -r -a route_labels <<< "$value"
+  for part in "${route_labels[@]}"; do
+    [[ "${#part}" -le 63 ]] || fail "$label 的每段域名不能超过 63 字节。"
+  done
+}
+
+normalize_route_domains() {
+  local candidates rule normalized=""
+  candidates="$(printf '%s' "$route_domains" | tr '[:upper:]' '[:lower:]' | tr ',[:space:]' '\n')"
+  while IFS= read -r rule; do
+    [[ -n "$rule" ]] || continue
+    validate_route_domain "$rule" "分流域名"
+    case "$rule" in
+      domain:*|full:*) ;;
+      *) rule="domain:$rule" ;;
+    esac
+    case $'\n'"$normalized"$'\n' in
+      *$'\n'"$rule"$'\n'*) continue ;;
+    esac
+    if [[ -n "$normalized" ]]; then normalized+=$'\n'; fi
+    normalized+="$rule"
+  done <<< "$candidates"
+  [[ -n "$normalized" ]] || fail "启用分流时，至少需要填写一个域名。"
+  route_domains="$normalized"
+}
+
+validate_route_auth() {
+  local user_bytes password_bytes
+  if [[ -z "$route_user" ]]; then
+    [[ -z "$route_password" ]] || fail "SOCKS5 密码必须与用户名一起填写。"
+    return 0
+  fi
+  user_bytes="$(printf '%s' "$route_user" | wc -c)"
+  password_bytes="$(printf '%s' "$route_password" | wc -c)"
+  (( user_bytes >= 1 && user_bytes <= 255 && password_bytes >= 1 && password_bytes <= 255 )) \
+    || fail "SOCKS5 用户名和密码各需 1 到 255 字节。"
+}
+
+select_routing_mode() {
+  route_domains=""
+  route_host=""
+  route_port=""
+  route_user=""
+  route_password=""
+  while :; do
+    printf '域名分流：\n  1) 普通模式（全部使用所选出口）\n  2) 自定义域名走 SOCKS5\n'
+    read -r -u 3 -p "请选择 [1]： " routing_mode || fail "无法读取分流模式。"
+    routing_mode="${routing_mode:-1}"
+    case "$routing_mode" in
+      1) return 0 ;;
+      2) break ;;
+      *) printf '请输入 1 或 2。\n' ;;
+    esac
+  done
+  set +x
+  printf '未命中域名继续使用所选 IPv4/IPv6 出口；命中域名走 SOCKS5。\n'
+  printf '普通域名包含子域名；只匹配完整域名可加 full: 前缀。\n'
+  read -r -u 3 -p "分流域名（空格或英文逗号分隔）： " route_domains \
+    || fail "无法读取分流域名。"
+  normalize_route_domains
+  read -r -u 3 -p "SOCKS5 服务器 IP 或域名： " route_host || fail "无法读取 SOCKS5 地址。"
+  validate_host "$route_host" "SOCKS5 服务器地址"
+  if [[ "$route_host" == \[*\] ]]; then route_host="${route_host:1:${#route_host}-2}"; fi
+  read -r -u 3 -p "SOCKS5 端口 [1080]： " route_port || fail "无法读取 SOCKS5 端口。"
+  route_port="${route_port:-1080}"
+  validate_port "$route_port" "SOCKS5 端口"
+  IFS= read -r -u 3 -p "SOCKS5 用户名（无需认证则留空）： " route_user || fail "无法读取 SOCKS5 用户名。"
+  if [[ -n "$route_user" ]]; then
+    printf 'SOCKS5 密码（输入不回显）： ' >/dev/tty
+    IFS= read -r -s -u 3 route_password || fail "无法读取 SOCKS5 密码。"
+    printf '\n' >/dev/tty
+  fi
+  validate_route_auth
+  printf 'SOCKS5 本身不加密，HTTPS 内容仍由 TLS 加密；上游地址需能从本机连通。\n'
+}
+
 probe_address_family() {
   local family_flag="$1"
   local endpoint
@@ -198,6 +285,7 @@ printf '正在检测 IPv4 和 IPv6 的外网 HTTPS 连通性（最长约 20 秒�
 detect_address_families
 select_address_family
 select_node_type
+select_routing_mode
 read -r -u 3 -p "公网 IP 或域名（客户端/CDN 入口，与出站方式无关）： " public_host
 direct_public_port=""
 direct_listen_port=""
@@ -338,6 +426,12 @@ export XRAY_SERVER_NAME="$server_name"
 export XRAY_CDN_DOMAIN="$cdn_domain"
 export XRAY_CDN_PORT="$cdn_port"
 export XRAY_WS_PUBLIC_PORT="$ws_public_port"
+export XRAY_ROUTING_MODE="$routing_mode"
+export XRAY_ROUTE_DOMAINS="$route_domains"
+export XRAY_ROUTE_HOST="$route_host"
+export XRAY_ROUTE_PORT="$route_port"
+export XRAY_ROUTE_USER="$route_user"
+export XRAY_ROUTE_PASSWORD="$route_password"
 python3 - "$tmp_dir/config.json" <<'PY'
 import json
 import os
@@ -410,10 +504,38 @@ config = {
         "streamSettings": {"sockopt": sockopt},
     }],
 }
+if os.environ.get("XRAY_ROUTING_MODE", "1") == "2":
+    server = {
+        "address": os.environ["XRAY_ROUTE_HOST"],
+        "port": int(os.environ["XRAY_ROUTE_PORT"]),
+    }
+    if os.environ.get("XRAY_ROUTE_USER"):
+        server["users"] = [{
+            "user": os.environ["XRAY_ROUTE_USER"],
+            "pass": os.environ["XRAY_ROUTE_PASSWORD"],
+        }]
+    config["outbounds"].append({
+        "protocol": "socks", "tag": "custom-upstream",
+        "settings": {"servers": [server]},
+    })
+    config["routing"] = {
+        "domainStrategy": "AsIs",
+        "rules": [{
+            "type": "field",
+            "domain": os.environ["XRAY_ROUTE_DOMAINS"].splitlines(),
+            "outboundTag": "custom-upstream",
+        }],
+    }
+    for inbound in inbounds:
+        inbound["sniffing"] = {
+            "enabled": True, "destOverride": ["http", "tls", "quic"],
+            "routeOnly": True,
+        }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
     f.write("\n")
 PY
+unset XRAY_ROUTE_USER XRAY_ROUTE_PASSWORD route_user route_password
 "$XRAY_BIN" run -test -config "$tmp_dir/config.json"
 if [[ -e "$XRAY_CONFIG" && "$(tr -d '[:space:]' < "$XRAY_CONFIG")" != '{}' ]]; then
   fail "The installer created an unexpected config; refusing to overwrite it."
@@ -519,6 +641,13 @@ print("\nXray 服务已启动。")
 print("节点出站方式：" + {
     "1": "仅 IPv4", "2": "仅 IPv6", "3": "双栈（TCP 优先 IPv6，IPv4 回退）",
 }[os.environ["XRAY_ADDRESS_FAMILY"]])
+if os.environ.get("XRAY_ROUTING_MODE", "1") == "2":
+    print("域名分流：已启用，仅自填域名走 SOCKS5；其他流量使用上述出口。")
+    print("分流规则：\n" + os.environ["XRAY_ROUTE_DOMAINS"])
+    print("SOCKS5 故障时，命中请求失败，不回退普通出口。")
+    print("SOCKS5 地址需本机可达，其连接不受上述普通出口的地址族限制。")
+else:
+    print("域名分流：普通模式。")
 if direct_enabled:
     direct_params = urlencode({
         "encryption": "none",
