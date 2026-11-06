@@ -231,7 +231,7 @@ class OptionalRoutingGeneratorTests(unittest.TestCase):
             },
             {
                 "name": "invalid_retries_then_ordinary",
-                "input": "invalid\n0\n3\n1\n",
+                "input": "invalid\n0\n4\n1\n",
                 "mode": "1", "domains": "", "host": "", "port": "",
                 "user": "", "password": "",
             },

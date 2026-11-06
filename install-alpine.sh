@@ -179,6 +179,157 @@ validate_route_auth() {
     || fail 'SOCKS5 用户名和密码各需 1 到 255 个 UTF-8 字节。'
 }
 
+parse_route_vless() {
+  # Parse secrets through stdin; never place the import link in process arguments.
+  route_vless_outbound=$(printf '%s' "$route_vless_link" | jq -Rsec '
+    def require($ok; $message):
+      if $ok then . else error($message) end;
+    def decode_uri:
+      [explode[] | if . < 128 then [.] | implode else [.] | implode | @uri end]
+      | join("")
+      | require((gsub("%[0-9A-Fa-f]{2}"; "") | contains("%") | not);
+          "百分号编码无效。")
+      | [scan("%[0-9A-Fa-f]{2}|.") | if startswith("%") then
+          .[1:] | ascii_downcase | explode
+          | map(if . <= 57 then . - 48 else . - 87 end)
+          | .[0] * 16 + .[1]
+        else explode[] end]
+      | reduce .[] as $byte (
+          {out: [], need: 0, value: 0, minimum: 0};
+          if .need == 0 then
+            if $byte < 128 then .out += [$byte]
+            elif $byte >= 194 and $byte <= 223 then
+              .need = 1 | .value = ($byte - 192) | .minimum = 128
+            elif $byte >= 224 and $byte <= 239 then
+              .need = 2 | .value = ($byte - 224) | .minimum = 2048
+            elif $byte >= 240 and $byte <= 244 then
+              .need = 3 | .value = ($byte - 240) | .minimum = 65536
+            else error("UTF-8 编码无效。") end
+          else
+            require($byte >= 128 and $byte <= 191; "UTF-8 编码无效。")
+            | .value = (.value * 64 + $byte - 128) | .need -= 1
+            | if .need == 0 then
+                require(.value >= .minimum and .value <= 1114111
+                  and (.value < 55296 or .value > 57343); "UTF-8 编码无效。")
+                | .out += [.value]
+              else . end
+          end)
+      | require(.need == 0; "UTF-8 编码不完整。")
+      | .out | implode
+      | require(all(explode[]; . >= 32 and (. < 127 or . > 159));
+          "链接参数不能包含控制字符。");
+    def dns_name:
+      length >= 1 and length <= 253
+      and all(split(".")[]; length <= 63
+        and test("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$"));
+    def ipv4:
+      test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")
+      and all(split(".")[]; tonumber <= 255
+        and (length == 1 or (startswith("0") | not)));
+    def ipv6:
+      (if contains(".") then
+        split(":")[-1] as $tail
+        | if $tail | ipv4 then rtrimstr($tail) + "0:0" else "" end
+      else . end)
+      | split("::") as $halves
+      | if ($halves | length) == 1 then
+          split(":") | length == 8 and all(.[]; test("^[A-Fa-f0-9]{1,4}$"))
+        elif ($halves | length) == 2 then
+          all($halves[]; . == "" or all(split(":")[]; test("^[A-Fa-f0-9]{1,4}$")))
+          and ([$halves[] | split(":")[] | select(length > 0)] | length < 8)
+        else false end;
+    def endpoint:
+      if contains(":") then ipv6
+      elif test("^[0-9.]+$") then ipv4 else dns_name end;
+    def sni_name:
+      dns_name and (test("^[0-9.]+$") | not);
+
+    require(length <= 16384; "VLESS 链接过长。")
+    | split("#")[0]
+    | require(all(explode[]; . > 32 and . != 127); "请粘贴完整的一行 VLESS 链接。")
+    | (capture("^vless://(?<id>[^@/?#]+)@(?<host>\\[[^\\]]+\\]|[^:/?#@]+):(?<port>[0-9]+)/?\\?(?<query>.*)$")
+        // error("VLESS 链接格式无效，需要地址、端口和参数。")) as $uri
+    | ($uri.id | decode_uri | ascii_downcase) as $id
+    | require($id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+        "VLESS 用户 ID 必须是 UUID。")
+    | ($uri.host | ltrimstr("[") | rtrimstr("]") | decode_uri | ascii_downcase) as $address
+    | require($address | endpoint; "VLESS 服务器地址无效。")
+    | require(($uri.host | startswith("[")) == ($address | contains(":"));
+        "只有 IPv6 地址需要使用方括号。")
+    | ($uri.port | tonumber) as $port
+    | require($port >= 1 and $port <= 65535; "VLESS 端口需要在 1 到 65535 之间。")
+    | (reduce ($uri.query | split("&")[]) as $item ({};
+        ($item | capture("^(?<key>[^=]+)=(?<value>.*)$")
+          // error("VLESS 查询参数需要使用名称=值。")) as $pair
+        | ($pair.key | decode_uri) as $key
+        | require(has($key) | not; "VLESS 链接含有重复参数。")
+        | .[$key] = ($pair.value | decode_uri))) as $q
+    | require(all($q | keys[]; IN("encryption", "security", "type", "flow", "sni",
+        "fp", "pbk", "sid", "spx", "alpn", "host", "path", "headerType",
+        "allowInsecure", "insecure")); "链接含有暂不支持的参数，请使用标准 REALITY/TLS 链接。")
+    | require(($q.encryption // "none") == "none"; "暂不支持此 VLESS encryption 设置。")
+    | require(($q.security == "reality" or $q.security == "tls");
+        "分流上游必须启用 REALITY 或 TLS，不能使用明文链接。")
+    | require(all(["allowInsecure", "insecure"][];
+        . as $key | ($q | has($key) | not) or ($q[$key] | IN("0", "false")));
+        "不能关闭 TLS 证书校验。")
+    | require(($q.headerType // "none") | IN("", "none"); "暂不支持 TCP 伪装头。")
+    | ($q.type // "tcp" | if . == "tcp" then "raw" else . end) as $network
+    | require($network == "raw" or ($network == "ws" and $q.security == "tls");
+        "只支持 REALITY/TCP、TLS/TCP 和 TLS/WebSocket。")
+    | ($q.flow // "") as $flow
+    | require($flow == "" or ($flow == "xtls-rprx-vision" and $network == "raw");
+        "此传输方式不支持链接中的 flow。")
+    | ($q.sni // (if $q.security == "tls" then $address else "" end)) as $sni
+    | require($sni | sni_name; "请在链接中提供有效的 TLS/REALITY SNI 域名。")
+    | ($q.fp // "chrome") as $fp
+    | require($fp | IN("chrome", "firefox", "safari", "ios", "android", "edge",
+        "360", "qq", "random", "randomized"); "暂不支持此 TLS 指纹。")
+    | require($network == "ws" or (($q.host // "") == "" and ($q.path // "") == "");
+        "TCP 链接不能包含 WebSocket Host 或路径。")
+    | {
+        protocol: "vless", tag: "custom-upstream",
+        settings: {vnext: [{address: $address, port: $port, users: [
+          {id: $id, encryption: "none"}
+          + (if $flow != "" then {flow: $flow} else {} end)
+        ]}]},
+        streamSettings: {network: $network, security: $q.security}
+      }
+    | if $q.security == "reality" then
+        require(($q.pbk // "") | test("^[A-Za-z0-9_-]{43}$"); "REALITY 公钥格式无效。")
+        | ($q.sid // "" | ascii_downcase) as $sid
+        | require(($sid | test("^[0-9a-f]{0,16}$")) and ($sid | length % 2 == 0);
+            "REALITY Short ID 需要 0 到 16 位偶数长度十六进制字符。")
+        | require(($q.alpn // "") == ""; "暂不支持 REALITY 自定义 ALPN。")
+        | ($q.spx // "/") as $spider
+        | require($spider | startswith("/"); "REALITY SpiderX 必须以 / 开头。")
+        | .streamSettings.realitySettings = {
+            show: false, serverName: $sni, fingerprint: $fp,
+            publicKey: $q.pbk, shortId: $sid, spiderX: $spider
+          }
+      else
+        require(all(["pbk", "sid", "spx"][]; . as $key | ($q[$key] // "") == "");
+            "TLS 链接不能携带 REALITY 参数。")
+        | .streamSettings.tlsSettings = {
+            serverName: $sni, fingerprint: $fp, allowInsecure: false
+          }
+        | if ($q.alpn // "") != "" then
+            ($q.alpn | split(",")) as $alpn
+            | require(all($alpn[]; test("^[A-Za-z0-9./_-]{1,32}$")); "ALPN 参数无效。")
+            | .streamSettings.tlsSettings.alpn = $alpn
+          else . end
+      end
+    | if $network == "ws" then
+        ($q.host // $sni) as $host
+        | ($q.path // "/") as $path
+        | require($host | dns_name; "WebSocket Host 需要是有效域名。")
+        | require($path | startswith("/"); "WebSocket 路径必须以 / 开头。")
+        | .streamSettings.wsSettings = {host: $host, path: $path}
+      else . end
+  ') || fail "无法导入 VLESS 分流上游，未安装配置。"
+  route_vless_link=
+}
+
 select_routing_mode() {
   routing_mode=1
   route_domains=
@@ -186,20 +337,31 @@ select_routing_mode() {
   route_port=
   route_user=
   route_password=
+  route_vless_link=
+  route_vless_outbound=
   while :; do
-    printf '流量分流：\n  1) 普通模式（全部使用本机出站）\n  2) 自定义域名分流（指定域名走 SOCKS5 上游）\n请选择 [1]：' >/dev/tty
+    printf '流量分流：\n  1) 普通模式（全部使用本机出站）\n  2) 自定义域名分流（指定域名走 SOCKS5 上游）\n  3) 自定义域名走 VLESS 加密上游（粘贴链接）\n请选择 [1]：' >/dev/tty
     IFS= read -r routing_mode <&3 || fail '无法读取分流模式。'
     routing_mode=${routing_mode:-1}
     case "$routing_mode" in
       1) return 0 ;;
-      2) break ;;
-      *) printf '请输入 1 或 2。\n' ;;
+      2|3) break ;;
+      *) printf '请输入 1、2 或 3。\n' ;;
     esac
   done
   set +x
   printf '需要分流的域名（空格或逗号分隔，裸域名包含子域，full: 表示精确匹配）：' >/dev/tty
   IFS= read -r route_domains <&3 || fail '无法读取分流域名。'
   normalize_route_domains
+  if [ "$routing_mode" = 3 ]; then
+    printf '支持 REALITY/TCP、TLS/TCP 和 TLS/WebSocket；NAT 落地使用公网映射端口。\n'
+    printf '粘贴完整 vless:// 链接（输入不回显）：' >/dev/tty
+    IFS= read -r -s route_vless_link <&3 || fail '无法读取 VLESS 上游链接。'
+    printf '\n' >/dev/tty
+    parse_route_vless
+    printf 'VLESS 上游已解析，稍后随完整配置一起检查；连通性仍需实测。\n'
+    return 0
+  fi
   printf 'SOCKS5 上游 IP 或域名（不带协议和端口）：' >/dev/tty
   IFS= read -r route_host <&3 || fail '无法读取 SOCKS5 上游地址。'
   case "$route_host" in
@@ -455,6 +617,7 @@ fi
 
 export XRAY_ROUTE_USER="$route_user"
 export XRAY_ROUTE_PASSWORD="$route_password"
+export XRAY_ROUTE_VLESS="$route_vless_outbound"
 jq -n \
   --arg mode "$node_type" --arg family "$address_family" --arg path "$ws_path" \
   --arg address "$listen_address" --arg direct_port "$direct_listen_port" \
@@ -507,13 +670,15 @@ jq -n \
       } else {} end))}
     }]
     }
-  | if $routing_mode == "2" then
+  | if $routing_mode == "2" or $routing_mode == "3" then
       .inbounds |= map(. + {
         sniffing: {
           enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: false
         }
       })
-      | .outbounds += [{
+      | .outbounds += [(if $routing_mode == "3" then
+          env.XRAY_ROUTE_VLESS | fromjson
+        else {
           protocol: "socks", tag: "custom-upstream",
           settings: {
             servers: [{
@@ -522,7 +687,7 @@ jq -n \
               users: [{user: env.XRAY_ROUTE_USER, pass: env.XRAY_ROUTE_PASSWORD}]
             } else {} end)]
           }
-        }]
+        } end)]
       | .routing = {
           domainStrategy: "AsIs",
           rules: [{
@@ -532,7 +697,7 @@ jq -n \
           }]
         }
     else . end' > "$tmp_dir/config.json"
-unset XRAY_ROUTE_USER XRAY_ROUTE_PASSWORD route_user route_password
+unset XRAY_ROUTE_USER XRAY_ROUTE_PASSWORD XRAY_ROUTE_VLESS route_user route_password route_vless_outbound
 "$tmp_dir/xray" run -test -config "$tmp_dir/config.json"
 id nobody >/dev/null 2>&1 || fail 'The nobody service user is missing.'
 service_group=$(id -gn nobody)
@@ -662,13 +827,17 @@ case "$address_family" in
   2) printf '节点出站方式：仅 IPv6\n' ;;
   3) printf '节点出站方式：双栈（TCP 优先 IPv6，IPv4 回退）\n' ;;
 esac
-if [ "${routing_mode:-1}" = 2 ]; then
-  printf '自定义域名分流：已启用；命中域名走 SOCKS5 上游，其余流量走本机。\n'
+if [ "${routing_mode:-1}" = 2 ] || [ "${routing_mode:-1}" = 3 ]; then
+  if [ "$routing_mode" = 3 ]; then
+    printf '自定义域名分流：已启用；命中域名走 VLESS 加密上游，其余流量走本机。\n'
+  else
+    printf '自定义域名分流：已启用；命中域名走 SOCKS5 上游，其余流量走本机。\n'
+    printf '分流上游：%s:%s（账号密码不回显）。\n' "$route_host" "$route_port"
+    printf 'SOCKS5 链路和认证不加密；HTTPS 内容仍使用 TLS。UDP/QUIC 需要上游支持 UDP。\n'
+  fi
   printf '命中域名的上游连接失败时，不会回落到本机出口。\n'
   printf '分流域名规则：\n%s\n' "$route_domains"
-  printf '分流上游：%s:%s（账号密码不回显）。\n' "$route_host" "$route_port"
   printf '本机 IPv4/IPv6 出站选择只约束普通流量；上游连接使用系统可达的地址族。\n'
-  printf 'SOCKS5 链路和认证不加密；HTTPS 内容仍使用 TLS。UDP/QUIC 需要上游支持 UDP。\n'
 else
   printf '流量分流：普通模式，全部使用本机出站。\n'
 fi
