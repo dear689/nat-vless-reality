@@ -4,11 +4,17 @@ set -Eeuo pipefail
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
+XRAY_MARKER="/usr/local/etc/xray/.nat-vless-installer"
+XRAY_RESOURCES="/usr/local/etc/xray/.nat-vless-resources"
 DEFAULT_SNI="gateway.icloud.com"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
+}
+
+record_resource() {
+  printf '%s\n' "$1" >> "$XRAY_RESOURCES"
 }
 
 validate_hostname() {
@@ -433,7 +439,8 @@ check_websocket_setup() {
 [[ -d /run/systemd/system ]] || fail "This script requires systemd."
 command -v apt-get >/dev/null 2>&1 || fail "Only Debian/Ubuntu systems are supported."
 
-if [[ -e "$XRAY_CONFIG" || -e "$XRAY_BIN" || -e /etc/systemd/system/xray.service ]]; then
+if [[ -e "$XRAY_CONFIG" || -e "$XRAY_BIN" || -e "$XRAY_MARKER" \
+    || -e "$XRAY_RESOURCES" || -e /etc/systemd/system/xray.service ]]; then
   fail "Xray is already installed or configured; refusing to overwrite an existing setup."
 fi
 
@@ -546,9 +553,31 @@ done
 
 apt-get install -y --no-install-recommends openssl python3
 
-tmp_dir="$(mktemp -d)"
+install -d -m 755 /usr/local
+tmp_dir="$(mktemp -d /usr/local/.nat-vless-install.XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s\n' "$$" > "$tmp_dir/installer.pid"
+printf 'nat-vless-stage-v1\n' > "$tmp_dir/.nat-vless-stage"
 curl -fsSL "$XRAY_INSTALL_URL" -o "$tmp_dir/install-release.sh"
+# Identify this attempt before the upstream installer can leave partial files.
+install -d -m 755 /usr/local/etc/xray
+printf 'nat-vless-reality-v1\n' > "$tmp_dir/ownership-marker"
+printf 'nat-vless-resources-v1\n' > "$tmp_dir/resources"
+chmod 600 "$tmp_dir/ownership-marker" "$tmp_dir/resources"
+mv -- "$tmp_dir/ownership-marker" "$XRAY_MARKER"
+mv -- "$tmp_dir/resources" "$XRAY_RESOURCES"
+# The upstream installer skips default config creation when this directory exists.
+printf '{}\n' > "$XRAY_CONFIG"
+chmod 644 "$XRAY_CONFIG"
+if ! getent group xray >/dev/null 2>&1; then
+  record_resource xray-group
+fi
+if ! getent passwd xray >/dev/null 2>&1; then
+  record_resource xray-user
+fi
 bash "$tmp_dir/install-release.sh" install --without-geodata --without-logfiles
 
 [[ -x "$XRAY_BIN" ]] || fail "Xray installer completed without installing the binary."
@@ -711,20 +740,38 @@ cloudflared_bin=""
 if [[ "$node_type" == 4 ]]; then
   if ! command -v cloudflared >/dev/null 2>&1; then
     install -d -m 755 /usr/share/keyrings
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-      -o /usr/share/keyrings/cloudflare-main.gpg
-    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
-      > /etc/apt/sources.list.d/cloudflared.list
+    [[ ! -L /usr/share/keyrings/cloudflare-main.gpg \
+        && ! -L /etc/apt/sources.list.d/cloudflared.list ]] \
+      || fail "Cloudflare package repository paths must not be symbolic links."
+    if [[ ! -e /usr/share/keyrings/cloudflare-main.gpg ]]; then
+      record_resource cloudflared-key
+      curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+        -o /usr/share/keyrings/cloudflare-main.gpg
+    fi
+    if [[ ! -e /etc/apt/sources.list.d/cloudflared.list ]]; then
+      record_resource cloudflared-repo
+      printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
+        > /etc/apt/sources.list.d/cloudflared.list
+    else
+      grep -Fxq 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+        /etc/apt/sources.list.d/cloudflared.list \
+        || fail "An existing Cloudflare repository differs from the expected source."
+    fi
     apt-get update
+    if ! dpkg-query -W -f='${Status}' cloudflared 2>/dev/null | grep -Fxq 'install ok installed'; then
+      record_resource cloudflared-package
+    fi
     apt-get install -y --no-install-recommends cloudflared
   fi
   cloudflared_bin="$(command -v cloudflared)" || fail "cloudflared was not installed."
   "$cloudflared_bin" tunnel run --help | grep -F -- '--token-file' >/dev/null \
     || fail "现有 cloudflared 不支持 --token-file，请先升级后重试。"
   if ! getent group cloudflared >/dev/null 2>&1; then
+    record_resource cloudflared-group
     addgroup --system cloudflared
   fi
   if ! getent passwd cloudflared >/dev/null 2>&1; then
+    record_resource cloudflared-user
     adduser --system --no-create-home --ingroup cloudflared \
       --home /nonexistent --shell /usr/sbin/nologin cloudflared
   fi
@@ -739,13 +786,11 @@ service_user="$(systemctl show -p User --value xray.service)"
   || fail "Could not determine the Xray systemd service user."
 service_group="$(id -gn "$service_user")"
 install -m 600 -o "$service_user" -g "$service_group" "$tmp_dir/config.json" "$XRAY_CONFIG"
-printf 'nat-vless-reality-v1\n' > /usr/local/etc/xray/.nat-vless-installer
-chmod 600 /usr/local/etc/xray/.nat-vless-installer
 systemctl enable xray.service
 systemctl restart xray.service
 systemctl is-active --quiet xray.service || fail "Xray did not start; inspect: journalctl -u xray -n 50"
 if [[ "$node_type" == 4 ]]; then
-  cat > /etc/systemd/system/cloudflared-nat-vless.service <<UNIT
+  cat > "$tmp_dir/tunnel-service" <<UNIT
 [Unit]
 Description=Cloudflare Tunnel for NAT VLESS WebSocket
 After=network-online.target xray.service
@@ -771,7 +816,8 @@ LockPersonality=true
 [Install]
 WantedBy=multi-user.target
 UNIT
-  chmod 644 /etc/systemd/system/cloudflared-nat-vless.service
+  chmod 644 "$tmp_dir/tunnel-service"
+  mv -- "$tmp_dir/tunnel-service" /etc/systemd/system/cloudflared-nat-vless.service
   systemctl daemon-reload
   systemctl enable --now cloudflared-nat-vless.service
   systemctl is-active --quiet cloudflared-nat-vless.service \

@@ -4,11 +4,40 @@ set -eu
 XRAY_BIN=/usr/local/bin/xray
 XRAY_CONFIG=/usr/local/etc/xray/config.json
 XRAY_SERVICE=/etc/init.d/xray
+XRAY_MARKER=/usr/local/etc/xray/.nat-vless-installer
+XRAY_RESOURCES=/usr/local/etc/xray/.nat-vless-resources
 DEFAULT_SNI=gateway.icloud.com
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
+}
+
+record_resource() {
+  printf '%s\n' "$1" >> "$XRAY_RESOURCES"
+}
+
+cleanup_install() {
+  cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$xray_commit_started" -eq 1 ] && [ "$xray_commit_complete" -eq 0 ]; then
+    rm -f -- "$XRAY_BIN" "$XRAY_CONFIG" "$XRAY_SERVICE"
+    # Keep ownership if Tunnel setup created resources needing the uninstaller.
+    if ! grep -q '^cloudflared-' "$XRAY_RESOURCES" 2>/dev/null; then
+      rm -f -- "$XRAY_MARKER" "$XRAY_RESOURCES"
+      rmdir /usr/local/etc/xray 2>/dev/null || true
+    fi
+    if [ "$tunnel_token_started" -eq 1 ]; then
+      rm -f -- /etc/nat-vless/cloudflared.token
+      rmdir /etc/nat-vless 2>/dev/null || true
+    fi
+  fi
+  if [ "$build_deps_started" -eq 1 ] && apk info -e .nat-vless-build-deps >/dev/null 2>&1; then
+    apk del .nat-vless-build-deps \
+      || printf 'Warning: temporary packages remain; run the uninstaller to clean them.\n' >&2
+  fi
+  rm -rf -- "$tmp_dir"
+  exit "$cleanup_status"
 }
 
 validate_hostname() {
@@ -463,11 +492,29 @@ command -v supervise-daemon >/dev/null 2>&1 \
 [ -e /run/openrc/softlevel ] \
   || fail 'OpenRC did not boot this container; cannot guarantee service startup or persistence.'
 [ ! -e "$XRAY_BIN" ] && [ ! -e "$XRAY_CONFIG" ] && [ ! -e "$XRAY_SERVICE" ] \
+  && [ ! -e "$XRAY_MARKER" ] && [ ! -e "$XRAY_RESOURCES" ] \
   || fail 'An Xray installation already exists; refusing to overwrite it.'
 if ! exec 3</dev/tty; then
   fail 'An interactive terminal is required.'
 fi
+
+# Keep the archive and extracted binary on disk, not in a possible /tmp tmpfs.
+install -d -m 755 /usr/local
+tmp_dir=$(mktemp -d /usr/local/.nat-vless-install.XXXXXX) || fail 'Not enough disk space for installation.'
+xray_commit_started=0
+xray_commit_complete=0
+tunnel_token_started=0
+build_deps_started=0
+trap cleanup_install EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s\n' "$$" > "$tmp_dir/installer.pid"
+printf 'nat-vless-stage-v1\n' > "$tmp_dir/.nat-vless-stage"
+
+# Install dependencies after cleanup and interruption tracking are ready.
 apk add --no-cache ca-certificates
+build_deps_started=1
 apk add --no-cache --virtual .nat-vless-build-deps curl jq unzip
 printf '正在检测 IPv4 和 IPv6 的外网 HTTPS 连通性（最长约 20 秒）...\n'
 detect_address_families
@@ -581,10 +628,6 @@ case "$(uname -m)" in
   *) fail "Unsupported architecture: $(uname -m)." ;;
 esac
 
-# Keep the archive and extracted binary on disk, not in a possible /tmp tmpfs.
-install -d -m 755 /usr/local
-tmp_dir=$(mktemp -d /usr/local/.nat-vless-install.XXXXXX) || fail 'Not enough disk space for installation.'
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 release="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$machine.zip"
 curl -fsSL "$release" -o "$tmp_dir/xray.zip"
 curl -fsSL "$release.dgst" -o "$tmp_dir/xray.zip.dgst"
@@ -737,28 +780,40 @@ fi
 
 # Refuse to replace files created by another process while downloading.
 [ ! -e "$XRAY_BIN" ] && [ ! -e "$XRAY_CONFIG" ] && [ ! -e "$XRAY_SERVICE" ] \
+  && [ ! -e "$XRAY_MARKER" ] && [ ! -e "$XRAY_RESOURCES" ] \
   || fail 'An Xray installation appeared during setup; refusing to overwrite it.'
 install -d -m 755 /usr/local/bin /usr/local/etc/xray
-install -m 755 "$tmp_dir/xray" "$XRAY_BIN"
+# Mark ownership before moving files so an uncatchable interruption is recoverable.
+printf 'nat-vless-reality-v1\n' > "$tmp_dir/ownership-marker"
+chmod 600 "$tmp_dir/ownership-marker"
+printf 'nat-vless-resources-v1\n' > "$tmp_dir/resources"
+chmod 600 "$tmp_dir/resources"
+xray_commit_started=1
+mv -- "$tmp_dir/ownership-marker" "$XRAY_MARKER"
+mv -- "$tmp_dir/resources" "$XRAY_RESOURCES"
 if [ "$node_type" = 4 ]; then
   if [ -z "$cloudflared_bin" ]; then
-    install -m 755 "$tmp_dir/cloudflared" /usr/local/bin/cloudflared
+    record_resource cloudflared-binary
+    mv -- "$tmp_dir/cloudflared" /usr/local/bin/cloudflared
     cloudflared_bin=/usr/local/bin/cloudflared
   fi
-  addgroup -S cloudflared >/dev/null 2>&1 || true
+  if ! grep -q '^cloudflared:' /etc/group; then
+    record_resource cloudflared-group
+    addgroup -S cloudflared
+  fi
   if ! id cloudflared >/dev/null 2>&1; then
+    record_resource cloudflared-user
     adduser -S -D -H -G cloudflared -s /sbin/nologin cloudflared
   fi
   install -d -m 750 -o root -g cloudflared /etc/nat-vless
   printf '%s' "$argo_token" > "$tmp_dir/cloudflared-token"
+  tunnel_token_started=1
   install -m 640 -o root -g cloudflared "$tmp_dir/cloudflared-token" \
     /etc/nat-vless/cloudflared.token
   unset argo_token
 fi
 install -m 640 -o root -g "$service_group" "$tmp_dir/config.json" "$XRAY_CONFIG"
-printf 'nat-vless-reality-v1\n' > /usr/local/etc/xray/.nat-vless-installer
-chmod 600 /usr/local/etc/xray/.nat-vless-installer
-cat > "$XRAY_SERVICE" <<OPENRC
+cat > "$tmp_dir/xray-service" <<OPENRC
 #!/sbin/openrc-run
 name="Xray"
 description="VLESS server"
@@ -771,12 +826,16 @@ command_user=nobody:$service_group
 pidfile=/run/xray.pid
 required_files=/usr/local/etc/xray/config.json
 OPENRC
-chmod 755 "$XRAY_SERVICE"
+chmod 755 "$tmp_dir/xray-service"
+mv -- "$tmp_dir/xray-service" "$XRAY_SERVICE"
+# Staging is on /usr/local: rename the large binary instead of copying it again.
+mv -- "$tmp_dir/xray" "$XRAY_BIN"
+xray_commit_complete=1
 rc-update add xray default
 rc-service xray start
 rc-service xray status || fail 'Xray did not start; inspect rc-service xray status.'
 if [ "$node_type" = 4 ]; then
-  cat > /etc/init.d/cloudflared-nat-vless <<OPENRC
+  cat > "$tmp_dir/tunnel-service" <<OPENRC
 #!/sbin/openrc-run
 name="Cloudflare Tunnel"
 description="Cloudflare Tunnel for NAT VLESS WebSocket"
@@ -787,7 +846,8 @@ command_user=cloudflared:cloudflared
 pidfile=/run/cloudflared-nat-vless.pid
 required_files=/etc/nat-vless/cloudflared.token
 OPENRC
-  chmod 755 /etc/init.d/cloudflared-nat-vless
+  chmod 755 "$tmp_dir/tunnel-service"
+  mv -- "$tmp_dir/tunnel-service" /etc/init.d/cloudflared-nat-vless
   rc-update add cloudflared-nat-vless default
   rc-service cloudflared-nat-vless start
   rc-service cloudflared-nat-vless status \
@@ -819,8 +879,9 @@ if [ "$direct_enabled" -eq 1 ] && [ "$ws_enabled" -eq 1 ]; then
 fi
 # Clean both the release archive and temporary packages after successful start.
 rm -rf "$tmp_dir"
-trap - EXIT HUP INT TERM
 apk del .nat-vless-build-deps || printf 'Warning: installer-only packages could not be removed.\n' >&2
+build_deps_started=0
+trap - EXIT HUP INT TERM
 printf '\nXray 服务已启动。VLESS 链接（请妥善保管）：\n'
 case "$address_family" in
   1) printf '节点出站方式：仅 IPv4\n' ;;
