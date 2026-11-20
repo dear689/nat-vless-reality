@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_MARKER="/usr/local/etc/xray/.nat-vless-installer"
@@ -11,6 +11,40 @@ DEFAULT_SNI="gateway.icloud.com"
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
+}
+
+download_file() {
+  local url="$1" output="$2" label="$3" status
+  printf '正在下载%s（连接超时 10 秒，失败有限重试）...\n' "$label"
+  if curl --disable --fail --show-error --location --progress-bar \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 10 --max-time 60 --speed-time 20 --speed-limit 1024 \
+    --retry 2 --retry-delay 2 --retry-max-time 90 \
+    "$url" --output "$output"; then
+    return 0
+  else
+    status=$?
+  fi
+  rm -f -- "$output"
+  fail "${label}下载失败（curl 状态 ${status}）。请检查该下载地址的 HTTPS 连通性。"
+}
+
+run_xray_installer() {
+  (
+    # Bound upstream downloads without modifying the official installer.
+    NAT_VLESS_REAL_CURL="$(type -P curl)" || fail "Could not locate curl."
+    export NAT_VLESS_REAL_CURL
+    install -d -m 700 "$tmp_dir/curl-bin" || fail "Could not prepare download timeouts."
+    cat > "$tmp_dir/curl-bin/curl" <<'SH' || fail "Could not write download timeouts."
+#!/bin/sh
+exec "$NAT_VLESS_REAL_CURL" --disable "$@" \
+  --connect-timeout 10 --max-time 180 --speed-time 30 --speed-limit 512 \
+  --retry 2 --retry-delay 2 --retry-max-time 190
+SH
+    chmod 700 "$tmp_dir/curl-bin/curl" || fail "Could not enable download timeouts."
+    export PATH="$tmp_dir/curl-bin:$PATH"
+    bash "$tmp_dir/install-release.sh" install --without-geodata --without-logfiles
+  )
 }
 
 record_resource() {
@@ -561,7 +595,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 printf '%s\n' "$$" > "$tmp_dir/installer.pid"
 printf 'nat-vless-stage-v1\n' > "$tmp_dir/.nat-vless-stage"
-curl -fsSL "$XRAY_INSTALL_URL" -o "$tmp_dir/install-release.sh"
+download_file "$XRAY_INSTALL_URL" "$tmp_dir/install-release.sh" "Xray 官方安装器"
 # Identify this attempt before the upstream installer can leave partial files.
 install -d -m 755 /usr/local/etc/xray
 printf 'nat-vless-reality-v1\n' > "$tmp_dir/ownership-marker"
@@ -578,7 +612,12 @@ fi
 if ! getent passwd xray >/dev/null 2>&1; then
   record_resource xray-user
 fi
-bash "$tmp_dir/install-release.sh" install --without-geodata --without-logfiles
+printf '正在安装 Xray 内核（GitHub 版本查询、内核和校验文件下载均有超时限制）...\n'
+if run_xray_installer; then
+  :
+else
+  fail "Xray 官方安装器未完成。raw 源码可访问不代表 GitHub 内核下载可访问；请检查上方具体错误。"
+fi
 
 [[ -x "$XRAY_BIN" ]] || fail "Xray installer completed without installing the binary."
 mkdir -p "$(dirname "$XRAY_CONFIG")"
@@ -745,8 +784,8 @@ if [[ "$node_type" == 4 ]]; then
       || fail "Cloudflare package repository paths must not be symbolic links."
     if [[ ! -e /usr/share/keyrings/cloudflare-main.gpg ]]; then
       record_resource cloudflared-key
-      curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-        -o /usr/share/keyrings/cloudflare-main.gpg
+      download_file https://pkg.cloudflare.com/cloudflare-main.gpg \
+        /usr/share/keyrings/cloudflare-main.gpg "Cloudflare 软件源签名密钥"
     fi
     if [[ ! -e /etc/apt/sources.list.d/cloudflared.list ]]; then
       record_resource cloudflared-repo

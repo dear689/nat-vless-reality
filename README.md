@@ -44,6 +44,8 @@ The separate Chinese routing menu defaults to **1) ordinary mode**. Choose **2) 
 
 The provider's external TCP port must map to the matching local listen port, and its firewall must allow that traffic. For an IPv6 origin endpoint, enter its IPv6 address without square brackets; the generated link will add them.
 
+On Debian/Ubuntu, the official Xray installer is fetched directly from `raw.githubusercontent.com` with visible progress, timeouts, low-speed detection, and limited retries. Its internal GitHub requests are also bounded through a temporary curl wrapper used only by that installer process. A working raw download does not prove that GitHub's release downloads work; a failed kernel download stops with an error rather than waiting indefinitely. These limits do not change package-manager downloads or the installed service.
+
 ## Startup and uninstall
 
 Startup is automatic: Debian/Ubuntu enables `xray.service`, and Alpine adds `xray` to OpenRC's `default` runlevel. Mode 4 also enables `cloudflared-nat-vless` in the same service manager. No additional startup command is required.
