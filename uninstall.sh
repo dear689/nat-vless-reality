@@ -245,7 +245,7 @@ fi
 if [ "$platform" = systemd ] && [ "$xray_found" -eq 1 ]; then
   loaded_instances=$(systemctl list-units --all --full --plain --no-legend 'xray@*.service') \
     || fail '无法检查其他 Xray 实例，未做任何修改。'
-  installed_instances=$(systemctl list-unit-files --no-legend 'xray@*.service') \
+  installed_instances=$(systemctl list-unit-files --no-legend) \
     || fail '无法检查 Xray 自启实例，未做任何修改。'
   if printf '%s\n%s\n' "$loaded_instances" "$installed_instances" \
     | grep -Eq '^xray@[^[:space:]]+\.service[[:space:]]'; then

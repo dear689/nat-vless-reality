@@ -158,8 +158,21 @@ systemctl() {
     is-active|is-enabled) return "${TEST_CLOUDFLARED_NATIVE_ACTIVE:-1}" ;;
   esac
   if [ "$1" = stop ] && [ "${TEST_STOP_FAIL:-0}" = 1 ]; then return 1; fi
+  if [ "$1" = list-units ] && [ "${TEST_LIST_UNITS_FAIL:-0}" = 1 ]; then return 1; fi
   if [ "$1" = list-units ] && [ "${TEST_INSTANCES:-0}" = 1 ]; then
     printf 'xray@other.service loaded active running\n'
+  fi
+  if [ "$1" = list-unit-files ]; then
+    [ "${TEST_LIST_UNIT_FILES_FAIL:-0}" != 1 ] || return 1
+    case "$*" in
+      *'xray@*.service'*)
+        [ "${TEST_INSTALLED_INSTANCES:-0}" = 1 ] || return 1
+        ;;
+    esac
+    printf 'ssh.service enabled enabled\n'
+    if [ "${TEST_INSTALLED_INSTANCES:-0}" = 1 ]; then
+      printf 'xray@other.service disabled enabled\n'
+    fi
   fi
   return 0
 }
@@ -309,11 +322,46 @@ rc-update() { printf 'rc-update %s\n' "$*" >> "$TEST_LOG"; }
         self.assertFalse(self.log.exists())
 
     def test_other_systemd_instances_block_shared_binary_removal(self):
-        self.fixture("systemd")
-        result = self.run_uninstall(TEST_INSTANCES="1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue((self.root / "usr/local/bin/xray").exists())
+        for instance_flag in ("TEST_INSTANCES", "TEST_INSTALLED_INSTANCES"):
+            with self.subTest(instance_flag=instance_flag):
+                self.setUp()
+                self.fixture("systemd")
+                result = self.run_uninstall(**{instance_flag: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue((self.root / "usr/local/bin/xray").exists())
+                self.assertNotIn("systemctl stop ", self.log.read_text(encoding="utf-8"))
+
+    def test_systemd_empty_unit_file_match_allows_interrupted_install_cleanup(self):
+        (self.root / "run/systemd/system").mkdir(parents=True)
+        config = self.put("/usr/local/etc/xray/config.json", "{}\n")
+        marker = self.put(
+            "/usr/local/etc/xray/.nat-vless-installer", "nat-vless-reality-v1\n",
+        )
+        manifest = self.resources("xray-user", "xray-group")
+        unrelated = self.put(
+            "/etc/systemd/system/other.service", "ExecStart=/usr/bin/true\n",
+        )
+        result = self.run_uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for target in (config, marker, manifest):
+            self.assertFalse(target.exists(), target)
+        self.assertTrue(unrelated.exists())
         self.assertNotIn("systemctl stop ", self.log.read_text(encoding="utf-8"))
+
+    def test_systemd_instance_query_failure_preserves_installation(self):
+        for query_flag in ("TEST_LIST_UNITS_FAIL", "TEST_LIST_UNIT_FILES_FAIL"):
+            with self.subTest(query_flag=query_flag):
+                self.setUp()
+                self.fixture("systemd")
+                result = self.run_uninstall(**{query_flag: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                for retained in (
+                    "usr/local/bin/xray", "usr/local/etc/xray/config.json",
+                    "usr/local/etc/xray/.nat-vless-installer",
+                    "etc/nat-vless/cloudflared.token",
+                ):
+                    self.assertTrue((self.root / retained).exists(), retained)
+                self.assertNotIn("systemctl stop ", self.log.read_text(encoding="utf-8"))
 
     def test_unknown_legacy_configuration_is_refused(self):
         self.fixture("systemd", marker=False)
